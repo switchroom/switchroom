@@ -557,7 +557,10 @@ class DurableCloseoutTests(unittest.TestCase):
                     body = response['payload']['content']['body']
                 if expected:
                     self.assertIn(expected, body)
-                self.assertNotIn('/private/', body)
+                if done and '/private/' in result:  # HF-823: a closing note keeps the paths it names
+                    self.assertIn('/private/report.md', body)
+                else:
+                    self.assertNotIn('/private/', body)
                 self.assertNotIn('synthetic-secret', body)
 
     def test_human_takeover_preserves_native_binding_and_original_reporting_requester(self):

@@ -60,6 +60,22 @@ class CheckboxCanonicalTests(unittest.TestCase):
         self.assertFalse(markdown_matches('See [X] here', 'See [x] here'))
         self.assertFalse(markdown_matches('- [X] Done', '- [x] Gone'))
         self.assertFalse(markdown_matches('- [X](https://a.test)', '- [x](https://a.test)'))
+
+    def test_checked_task_holding_inline_code_is_equivalent(self):
+        # HF-813: Linear stored `- [X] Report ... `plugin.yaml`: `7c104c4b3759``; the readback of the
+        # agent's own plan edit then looked like a person's edit and later updates became comments.
+        self.assertTrue(markdown_matches('- [X] Report `plugin.yaml`: `7c10`', '- [x] Report `plugin.yaml`: `7c10`'))
+        self.assertTrue(markdown_matches('  - [X] read `a` and [b](https://b.test)', '  - [x] read `a` and [b](https://b.test)'))
+        self.assertFalse(markdown_matches('- [X] Report `plugin.yaml`', '- [ ] Report `plugin.yaml`'))
+        self.assertFalse(markdown_matches('- [ ] Report `plugin.yaml`', '- [x] Report `plugin.yaml`'))
+        self.assertFalse(markdown_matches('- `[X]` code', '- `[x]` code'))
+        section = ("## Plan and progress (agent)\nStatus: both values read.\n"
+                   "- [x] Report the sha256 of `/opt/hermes/plugins/linear/plugin.yaml`: `7c104c4b3759`\n"
+                   "- [ ] Post a checkpoint\n  - [x] plan section posted\n  - [ ] complete")
+        stored = ("## Plan and progress (agent)\n\nStatus: both values read.\n\n"
+                  "- [X] Report the sha256 of `/opt/hermes/plugins/linear/plugin.yaml`: `7c104c4b3759`\n"
+                  "- [ ] Post a checkpoint\n  - [X] plan section posted\n  - [ ] complete")
+        self.assertTrue(markdown_matches(stored, section))
         self.assertFalse(markdown_matches('- [X]abc', '- [x]abc'))
 
     def test_linear_bullet_depth_and_link_wrappers_are_equivalent_but_targets_are_not(self):

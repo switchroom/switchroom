@@ -76,6 +76,19 @@ class ReadableSummaryTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertEqual(_project_summary(f"See {path} now.", 1500), f"See {shown} now.")
 
+    def test_closing_note_keeps_full_paths_and_slash_words(self):
+        # HF-823: a Done note named `/opt/hermes/plugins/linear/plugin.yaml` as `plugin.yaml`.
+        text = ("Read `/opt/hermes/plugins/linear/plugin.yaml` and /opt/data/workspace/repo/a.py; "
+                "CI/CD and read/write stay as written, see [the log](/var/log/app.log).")
+        self.assertEqual(_project_summary(text, 1500, keep_paths=True),
+                         "Read `/opt/hermes/plugins/linear/plugin.yaml` and /opt/data/workspace/repo/a.py; "
+                         "CI/CD and read/write stay as written, see the log (`/var/log/app.log`).")
+        # Secrets are still redacted; only the path masking is off.
+        self.assertEqual(_project_summary("Token ghp_abc123 in /opt/x/y.py.", 1500, keep_paths=True),
+                         "Token [redacted] in /opt/x/y.py.")
+        body = _done_body(_project_summary("Changed `/opt/hermes/plugins/linear/plugin.yaml`.", 4000, keep_paths=True), [])
+        self.assertEqual(body, "Done. Changed `/opt/hermes/plugins/linear/plugin.yaml`.")
+
     def test_trim_never_leaves_a_code_fence_open(self):
         text = "Summary first.\n\n```python\n" + "".join(f"line_{n} = {n}\n" for n in range(80)) + "```\n\nAfter."
         for limit in (60, 120, 300, 700):

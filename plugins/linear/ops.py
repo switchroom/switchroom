@@ -5,7 +5,8 @@ import sqlite3
 import time
 from contextlib import closing
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+from . import waits
 from .store import Store, advisory
 
 RESOLVE = "Check the issue in Linear, then: hermes linear resolve {id} applied|not_applied --evidence \"<what you saw>\""
@@ -43,15 +44,73 @@ NOTHING = "Nothing to do."
 HISTORY_ACTIONS = frozenset({RETAINED, NOTHING})  # retained records: shown as one count line
 AGE_LIMIT = 7 * 86_400  # undelivered writes older than this are no longer listed one by one
 
-def stuck(state: Path, ingress: Path, profile: str, now: float | None = None) -> list[dict[str, Any]]:
+PARK_GRACE = 15 * 60  # a park this far past its window was not resumed by the gateway (HF-823)
+PARK_LIFECYCLE = ("blocked", "block_loop_detected", "unblocked", "promoted")  # core's _LIFECYCLE, as in bridge.py
+STUCK_PARK = ("Check the gateway log for external_wait.resume on this task, then resume or stop the task "
+          "on its board.")
+
+def native_boards(board: str) -> Path | None:
+    """The board database core uses for ``board``, or None where core is not importable."""
+    try:
+        from hermes_cli import kanban_db
+        return Path(kanban_db.kanban_db_path(board=board))
+    except Exception:  # noqa: BLE001 - a status view without core still lists the outbox
+        return None
+
+def _parks(db: sqlite3.Connection, boards: Callable[[str], Path | None], now: float, add) -> None:
+    """Bound tasks parked on CI or a dependency: in progress inside the window, an operator item past it.
+
+    The gateway rechecks a CI park every two minutes and resumes it once CI on its head finishes or
+    its window passes, so a CI park still blocked PARK_GRACE past its window is stuck. A dependency
+    park with no CI gate has no window of its own; it counts as stuck past waits.CI_MAX_WINDOW."""
+    bound: dict[str, list[tuple[str, str]]] = {}
+    for row in _rows(db, "SELECT m.value, w.task_id FROM metadata m JOIN work w ON m.key = 'native-binding:' || w.issue_id "
+                         "WHERE m.key LIKE 'native-binding:%' AND w.origin = 'native'"):
+        try:
+            binding = json.loads(row["value"])
+        except (TypeError, ValueError):
+            continue
+        if isinstance(binding, dict) and binding.get("task_id") == row["task_id"]:
+            bound.setdefault(str(binding.get("board") or "default"), []).append((binding.get("issue_id") or "", row["task_id"]))
+    for board, tasks in sorted(bound.items()):
+        path = boards(board)
+        if path is None or not path.is_file():
+            continue
+        with closing(_read(path)) as native:
+            for issue, task_id in tasks:
+                task = _rows(native, "SELECT status FROM tasks WHERE id = ?", task_id)
+                if not task or task[0]["status"] not in ("blocked", "triage"):
+                    continue
+                last = _rows(native, "SELECT kind, payload, created_at FROM task_events WHERE task_id = ? AND kind IN "
+                             f"({','.join('?' * len(PARK_LIFECYCLE))}) ORDER BY id DESC LIMIT 1", task_id, *PARK_LIFECYCLE)
+                if not last or last[0]["kind"] not in ("blocked", "block_loop_detected"):
+                    continue
+                try:
+                    payload = json.loads(last[0]["payload"] or "{}")
+                except (TypeError, ValueError):
+                    continue
+                wait = waits.parse(payload) if isinstance(payload, dict) else None
+                if not wait:
+                    continue
+                window = max(gate["window"] for gate in wait["ci"]) if wait["ci"] else waits.CI_MAX_WINDOW
+                since, what = float(last[0]["created_at"]), "CI" if wait["ci"] else "a dependency"
+                if now - since > window + PARK_GRACE:
+                    add(issue, task_id, since, f"parked on {what} and still blocked {int((now - since - window) // 60)} min "
+                        "past its window; the gateway did not resume it", STUCK_PARK, True)
+                else:
+                    add(issue, task_id, since, f"parked on {what}", "Resumes by itself when that is done.")
+
+def stuck(state: Path, ingress: Path, profile: str, now: float | None = None, *,
+          boards: Callable[[str], Path | None] | None = None) -> list[dict[str, Any]]:
     """Every item holding an issue or a delivery, oldest first. `act` marks the ones only an operator can clear."""
-    return _scan(state, ingress, profile, now)[0]
+    return _scan(state, ingress, profile, now, boards=boards)[0]
 
 def aged_out(state: Path, ingress: Path, profile: str, now: float | None = None) -> int:
     """Undelivered writes past AGE_LIMIT that stuck() no longer lists; counted so they stay visible."""
     return _scan(state, ingress, profile, now)[1]
 
-def _scan(state: Path, ingress: Path, profile: str, now: float | None = None) -> tuple[list[dict[str, Any]], int]:
+def _scan(state: Path, ingress: Path, profile: str, now: float | None = None, *,
+          boards: Callable[[str], Path | None] | None = None) -> tuple[list[dict[str, Any]], int]:
     now, items, dismissed, aged = time.time() if now is None else now, [], set(), 0
     def add(issue: str, ref: str, since: float, why: str, action: str, act: bool = False) -> None:
         items.append({"issue": issue or "-", "ref": ref, "age_s": max(0, int(now - since)), "why": why,
@@ -117,6 +176,8 @@ def _scan(state: Path, ingress: Path, profile: str, now: float | None = None) ->
                 add(request.get("issue_id") or "", row["key"], now,
                     f"native {request.get('kind') or 'delivery'} outcome needs reconciliation",
                     "Inspect native task/comment/run and external state. Reuse the original request; never blindly replay.", True)
+            if boards is not None:
+                _parks(db, boards, now, add)
     if ingress.is_file():
         with closing(_read(ingress)) as db:
             for row in _rows(db, "SELECT logical_agent, delivery_id, payload, received_at, status, attempts FROM deliveries WHERE "
@@ -224,7 +285,7 @@ def run(args: Any, state: Path, ingress: Path, profile: str, *, origin_settings:
         print(json.dumps({"ok": True, **result}))
         return 0
     if args.linear_command == "status":
-        items, aged = _scan(state, ingress, profile)
+        items, aged = _scan(state, ingress, profile, boards=native_boards)
         print(json.dumps(items, indent=2) if args.json else report(items, show_all=getattr(args, "all", False), aged=aged))
         return 1 if any(item["act"] for item in items) else 0
     if args.linear_command == "resolve":

@@ -1059,7 +1059,7 @@ class Store:
                     return False
             db.execute("UPDATE work SET last_event_id=MAX(last_event_id,?) WHERE issue_id=?", (event_id, issue_id))
             return True
-    PLAN_KEYS = frozenset({"written", "pending", "pending_row", "backoff", "last_comment", "comment_row"})
+    PLAN_KEYS = frozenset({"written", "written_event", "pending", "pending_row", "backoff", "last_comment", "comment_row"})
     def plan_state(self, issue_id: str) -> dict[str, Any]:
         """What this bridge last wrote in the issue's agent plan section, and whether it backed off."""
         with self._tx() as db:

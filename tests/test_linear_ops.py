@@ -8,6 +8,7 @@ import unittest
 import uuid
 from contextlib import closing, redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
 
 from linear_fake_api import load_plugin
 from linear_ingress_fixture import IngressStore, Route
@@ -197,6 +198,69 @@ class LinearOperatorTests(unittest.TestCase):
         self.assertFalse(items["fence"]["act"])  # a policy fence alone is not an alarm
         self.assertNotIn("requester outside scope", ops.report(list(items.values())))  # reasons stay in the database
         self.assertTrue(items[refused]["act"])
+
+
+    # HF-823: a CI or dependency park the gateway never resumed is an operator item.
+    def board(self, *tasks):
+        """A native board with core's two tables: (task_id, status, [(kind, payload, created_at), ...])."""
+        path = self.home / "board.db"
+        with closing(sqlite3.connect(path)) as db:
+            db.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT NOT NULL)")
+            db.execute("CREATE TABLE task_events (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, kind TEXT, "
+                       "payload TEXT, created_at INTEGER)")
+            for task_id, status, events in tasks:
+                db.execute("INSERT INTO tasks VALUES (?,?)", (task_id, status))
+                for kind, payload, at in events:
+                    db.execute("INSERT INTO task_events (task_id,kind,payload,created_at) VALUES (?,?,?,?)",
+                               (task_id, kind, json.dumps(payload) if payload is not None else None, at))
+            db.commit()
+        return {"work": path}.get
+
+    @staticmethod
+    def parked_on(reason):
+        return {"reason": reason, "kind": "needs_input", "requested_kind": "dependency", "rekind_reason": "no_open_parent"}
+
+    def test_park_past_its_window_needs_an_operator(self):
+        ci = self.parked_on("CI gate: https://github.com/o/r/pull/7 within 90m")
+        tasks = []
+        for n, (status, events) in enumerate((
+                ("blocked", [("blocked", ci, 0), ("worker_result", {"exit_code": 130}, 1)]),  # stuck: 90 + 15 min passed
+                ("blocked", [("blocked", self.parked_on("CI gate: o/r@" + "a" * 40), 0)]),  # default 3 h window: in progress
+                ("triage", [("block_loop_detected", ci, 0)]),  # the loop breaker keeps the same wait
+                ("blocked", [("blocked", self.parked_on("Waits on ABC-12 closing"), 0)]),  # dependency: 24 h window
+                ("blocked", [("blocked", ci, 0), ("unblocked", None, 10), ("blocked", {"reason": "need a decision",
+                                                                                     "kind": "needs_input"}, 20)]),
+                ("ready", [("blocked", ci, 0), ("unblocked", None, 10)]),  # resumed
+                ("blocked", [("blocked", {"reason": "CI gate: https://github.com/o/r/pull/7"}, 0)]))):  # not re-kinded
+            self.store.bind_native(f"issue-p{n}", f"t_p{n}", "default", "work", at=0)
+            tasks.append((f"t_p{n}", status, events))
+        boards = self.board(*tasks)
+        now = 90 * 60 + 15 * 60 + 1
+        items = {i["ref"]: i for i in ops.stuck(self.state, self.inbox, "default", now=now, boards=boards)}
+        self.assertTrue(items["t_p0"]["act"])
+        self.assertIn("parked on CI", items["t_p0"]["why"])
+        self.assertEqual(items["t_p0"]["issue"], "issue-p0")
+        self.assertFalse(items["t_p1"]["act"])
+        self.assertTrue(items["t_p2"]["act"])
+        self.assertFalse(items["t_p3"]["act"])
+        self.assertIn("dependency", items["t_p3"]["why"])
+        self.assertNotIn("t_p4", items)  # a later question is a person's, not a park
+        self.assertNotIn("t_p5", items)
+        self.assertNotIn("t_p6", items)
+        # A minute inside the grace the park is still in progress.
+        early = {i["ref"]: i for i in ops.stuck(self.state, self.inbox, "default", now=now - 120, boards=boards)}
+        self.assertFalse(early["t_p0"]["act"])
+        late = {i["ref"]: i for i in ops.stuck(self.state, self.inbox, "default", now=86_400 + 15 * 60 + 1, boards=boards)}
+        self.assertTrue(late["t_p1"]["act"] and late["t_p3"]["act"])
+        # The CLI (and the container health check that runs it) exits 1 for it.
+        with patch.object(ops, "native_boards", boards):
+            with patch.object(ops.time, "time", return_value=now):
+                code, out = self.cli("status")
+        self.assertEqual(code, 1)
+        self.assertIn("2 item(s) need an operator, 2 in progress", out.splitlines()[0])
+        self.assertIn("ACT issue-p0 [t_p0]", out)
+        # Without a readable board the outbox view still works.
+        self.assertEqual(ops.stuck(self.state, self.inbox, "default", now=now, boards=lambda board: None), [])
 
 
 if __name__ == "__main__":
