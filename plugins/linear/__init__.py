@@ -678,7 +678,8 @@ def register(ctx: Any) -> None:
         ctx.register_cli_command("linear", "Show and resolve held Linear reporting", ops.setup,
                                  lambda args: ops.run(args, *paths(), origin_settings=origin_settings()))
     if hasattr(ctx, "register_command") and not ctx.get_config("specialist_scope"):
-        ctx.register_command("linear-status", lambda raw_args="": ops.report(ops.stuck(*paths(), boards=ops.native_boards)),
+        ctx.register_command("linear-status", lambda raw_args="": ops.report(ops.stuck(*paths(), boards=ops.native_boards,
+                                                                                   board_names=ops.native_board_names)),
                              description="Show held Linear reporting and reconciliation")
 
     def native_hint(**_: Any) -> None:

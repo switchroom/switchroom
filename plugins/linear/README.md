@@ -603,6 +603,12 @@ event since the block. A Stop or answer that lands first wins, and the comment s
 information. A repeated park on the same task lands in triage through core's block-loop breaker;
 it carries the same wait and resumes the same way, up to 20 CI parks per task.
 
+A park on a task no Linear issue is bound to (HF-827), such as a follow-up the agent created
+itself, resumes the same way: once a minute the plugin reads this profile's blocked and triaged
+tasks on every board of its home and decides each unbound wait exactly as above, with nothing
+written to Linear. `hermes linear status` lists such a park as `- [<board>:<task>]`, and as an
+operator item once it is still blocked 15 minutes past its window.
+
 A finished native task is Done in Linear (Ken's F28 decision, 23 Nov 2026): its closing response completes the Agent Session and points to the closing issue comment, which carries the worker's summary, its evidence links and, for each PR named as evidence, a `Pull request: <url> (<state>)` line read from GitHub at close (merged, closed without merging, or open with its checks passed, failed or still running; no state when GitHub would not say). PR checks gate nothing and nothing waits on them: there are no In Review acceptance waits, rechecks or "Verifying" keepalives. A run that shows no evidence at all (no link and no meaningful local summary) still goes to Blocked. Closeouts an older build left waiting (its In Review acceptance wait, or its Blocked "pull request could not be verified" closeout) are closed out again once, through the same path, as Done; an older build's queued "Verifying" keepalive is dropped unsent. A session Linear opens after the work already finished (for example `record_done` from chat) gets the result, summary and evidence links, as its reply. Work archived or cancelled without a verified outcome posts nothing; a
 started state this app set (In Progress, Blocked, In Review) becomes Todo, since no agent is
 working on it now, including after an older build's Blocked closeout.

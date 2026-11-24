@@ -262,6 +262,34 @@ class LinearOperatorTests(unittest.TestCase):
         # Without a readable board the outbox view still works.
         self.assertEqual(ops.stuck(self.state, self.inbox, "default", now=now, boards=lambda board: None), [])
 
+    # HF-827: a park on a task no Linear issue is bound to is listed too, under its board.
+    def test_unbound_park_past_its_window_needs_an_operator(self):
+        ci = self.parked_on("CI gate: https://github.com/o/r/pull/7 within 90m")
+        self.store.bind_native("issue-b0", "t_b0", "default", "work", at=0)
+        boards = self.board(("t_b0", "blocked", [("blocked", ci, 0)]),  # bound: listed once, under its issue
+                            ("t_u0", "blocked", [("blocked", ci, 0), ("worker_result", {"exit_code": 130}, 1)]),
+                            ("t_u1", "blocked", [("blocked", self.parked_on("CI gate: o/r@" + "a" * 40), 0)]),
+                            ("t_u2", "blocked", [("blocked", {"reason": "need a decision", "kind": "needs_input"}, 0)]),
+                            ("t_u3", "ready", [("blocked", ci, 0), ("unblocked", None, 10)]))
+        now = 90 * 60 + 15 * 60 + 1
+        names = lambda: ["default", "work"]  # noqa: E731 - "default" has no board file here
+        items = {i["ref"]: i for i in ops.stuck(self.state, self.inbox, "default", now=now, boards=boards, board_names=names)}
+        self.assertEqual(sorted(items), ["t_b0", "work:t_u0", "work:t_u1"])
+        self.assertEqual(items["t_b0"]["issue"], "issue-b0")
+        self.assertTrue(items["work:t_u0"]["act"])
+        self.assertEqual(items["work:t_u0"]["issue"], "-")
+        self.assertIn("parked on CI and still blocked", items["work:t_u0"]["why"])
+        self.assertIn("no Linear issue", items["work:t_u0"]["why"])
+        self.assertFalse(items["work:t_u1"]["act"])  # default 3 h window: still in progress
+        # Without the board list (older callers) only bound tasks are read, as before.
+        self.assertEqual(sorted(i["ref"] for i in ops.stuck(self.state, self.inbox, "default", now=now, boards=boards)), ["t_b0"])
+        # The CLI scans every board, so the health check exits 1 for the unbound park.
+        with patch.object(ops, "native_boards", boards), patch.object(ops, "native_board_names", names):
+            with patch.object(ops.time, "time", return_value=now):
+                code, out = self.cli("status")
+        self.assertEqual(code, 1)
+        self.assertIn("ACT - [work:t_u0]", out)
+
 
 if __name__ == "__main__":
     unittest.main()
