@@ -25,10 +25,10 @@ env:
   IMAGE_REPOSITORY: ghcr.io/switchroom/switchroom
   TEST_IMAGE: ghcr.io/switchroom/switchroom:sha-${{ github.sha }}
   ONEPASSWORD_CLI_IMAGE: docker.io/1password/op@sha256:b0d7eebcb09bdc9d5862af91533e1851c968d4f969270c906f5da8c574f87e93
-  CLAUDE_CODE_VERSION: "2.1.323"
-  CLAUDE_AGENT_ACP_VERSION: "0.106.0"
-  CODEX_VERSION: "0.167.2"
-  GROK_VERSION: "1.0.77"
+  CLAUDE_CODE_VERSION: "2.1.325"
+  CLAUDE_AGENT_ACP_VERSION: "0.112.0"
+  CODEX_VERSION: "0.172.0"
+  GROK_VERSION: "1.0.92"
   CLAUDE_ACP_PLUGIN_SOURCE: https://github.com/mvdbastos/hermes-acp-agents
   CLAUDE_ACP_PLUGIN_REVISION: 0526610a3945cc376ac517b63ca358a5b838a2fc
   # Scanner pins match the versions the previously used anchore/sbom-action v0.24.2 and
@@ -311,7 +311,7 @@ jobs:
           assert pathlib.Path("/usr/local/bin/hermes-claude-acp-subscription").is_file()
           assert pathlib.Path("/opt/hermes/bin/tooling-policy-hook").is_file()
           assert pwd.getpwnam("hermes").pw_uid == 1000
-          assert subprocess.check_output(["gh", "--version"], text=True).split()[2] == "2.104.0"
+          assert subprocess.check_output(["gh", "--version"], text=True).split()[2] == "2.105.0"
           assert metadata.version("honcho-ai") == "2.9.0"
           subprocess.check_call(["/opt/hermes/.venv/bin/python", "/opt/hermes-fleet/bin/verify-honcho-runtime.py"])
           subprocess.check_call(["/opt/hermes/.venv/bin/python", "/opt/hermes-fleet/bin/verify-honcho-plugin-core-seams.py", "/opt/hermes/plugins/memory/honcho", "/opt/hermes"])
@@ -824,7 +824,7 @@ jobs:
           assert pathlib.Path("/usr/local/bin/hermes-claude-acp-subscription").is_file()
           assert pathlib.Path("/opt/hermes/bin/tooling-policy-hook").is_file()
           assert pwd.getpwnam("hermes").pw_uid == 1000
-          assert subprocess.check_output(["gh", "--version"], text=True).split()[2] == "2.104.0"
+          assert subprocess.check_output(["gh", "--version"], text=True).split()[2] == "2.105.0"
           assert metadata.version("honcho-ai") == "2.9.0"
           subprocess.check_call(["/opt/hermes/.venv/bin/python", "/opt/hermes-fleet/bin/verify-honcho-runtime.py"])
           subprocess.check_call(["/opt/hermes/.venv/bin/python", "/opt/hermes-fleet/bin/verify-honcho-plugin-core-seams.py", "/opt/hermes/plugins/memory/honcho", "/opt/hermes"])
