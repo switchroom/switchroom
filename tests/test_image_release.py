@@ -492,6 +492,12 @@ class FleetImageReleaseTests(unittest.TestCase):
         self.assertNotIn("imagetools inspect --format '{{.Digest}}'", publish)
         self.assertIn("Verify promoted SHA tag resolves to staged digest", publish)
         self.assertIn("promoted SHA tag does not resolve to staged digest", publish)
+        verify = publish.split("- name: Verify promoted SHA tag resolves to staged digest", 1)[1]
+        verify = verify.split("\n      - name: ", 1)[0]
+        # Registry read-after-write is eventually consistent: bounded wait, exact verdict.
+        self.assertIn("for attempt in $(seq 1 12); do", verify)
+        self.assertIn('test "$promoted_digest" = "$STAGED_DIGEST" ||', verify)
+        self.assertNotIn("continue-on-error", verify)
 
     def test_image_bake_jobs_pin_the_docker_classic_store_runner(self) -> None:
         # ubuntu-latest (26.04) uses the containerd image store; docker save then no
