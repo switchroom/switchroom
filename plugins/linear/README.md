@@ -495,6 +495,29 @@ API turns use the actual upstream API-server session producer; messaging turns r
 platform, user, route and session fields. An API session may have no messaging user ID; the
 plugin preserves that fact and relies on the API host's existing admission.
 
+### Scheduled jobs
+
+A cron run binds no session key, on purpose, so its output never routes into a person's chat.
+The plugin accepts the scheduler's own markers instead: the `HERMES_CRON_SESSION` ContextVar
+bound for the run and the cron execution the scheduler entered after winning it
+(`cron.execution_identity.current_cron_execution`). Both must be present in the tool call's
+context; `os.environ` copies, model arguments and delegated children never count, and a Core
+without the execution identity keeps refusing. The caller is this profile's own app with
+platform `cron` and session key `cron:<job_id>:<execution_id>`, which queued content records
+as provenance.
+
+A scheduled run may use `status`, `create_issue` (without `start_work` or `record_done`),
+`add_comment`, `update_description` and `link_issue`. Every other action (`work_on`,
+`take_over`, `resume_owner`, `hand_off`, `track`, `followup`, `delegate_self`,
+`create_project`, or `create_issue` that would start or close work) is refused with
+`cron_scope_refused` before any Linear call; starting, owning or handing over work needs a
+person's chat.
+
+A `no_agent` script runs as a subprocess and has no tool context, so it cannot publish. Make
+it the job's `script` with `no_agent` off instead: its stdout reaches a short agent turn that
+files the records with `create_issue`, and a last stdout line of `{"wakeAgent": false}` skips
+the turn on quiet days.
+
 Desktop/API processes use the same gateway bridge through a profile-private Unix socket.
 Every action carries the complete captured context, including native delegated-child
 restrictions. A delegated child cannot relay a native follow-up through the service. Both sides validate home/profile and

@@ -400,6 +400,70 @@ class ContentActionTests(unittest.TestCase):
         self.assertTrue(again['ok'])
         self.assertEqual(set(self.remote.issues), {'issue-1', self.request_id})
 
+    def cron_context(self):
+        return replace(self.context, platform='cron', source='cron', session_key='cron:job1:exec1',
+                       session_id='exec1', user_id='', chat_id='')
+
+    def test_scheduled_run_files_comments_and_describes_with_its_job_as_provenance(self):
+        cron = self.cron_context()
+        created = json.loads(chat.handle(self.bridge, {'action': 'create_issue', 'id': self.request_id,
+            'title': 'Reply to the speaker outline', 'team': 'team-1', 'project': 'none', 'description': BODY}, cron))
+        self.assertTrue(created['ok'], created)
+        self.assertEqual(created['issue']['id'], self.request_id)
+        self.assertIsNone(self.remote.issues[self.request_id]['assignee'])  # undelegated: no work was started
+        for action in ('add_comment', 'update_description'):
+            with self.subTest(action=action):
+                request_id = str(uuid.uuid4())
+                reply = self.invoke(action, request_id=request_id, context=cron)
+                self.assertTrue(reply['ok'], reply)
+                payload = self.store.outbox_row(request_id)['payload']
+                self.assertEqual(payload['caller_context']['platform'], 'cron')
+                self.assertEqual(payload['caller_context']['session_key'], 'cron:job1:exec1')
+        # Reads and links pass the gate too (their behaviour is the ordinary chat path).
+        for action in ('status', 'link_issue'):
+            self.assertIsNone(chat.cron_refusal({'action': action}, action, cron))
+
+    def test_scheduled_run_never_starts_owns_routes_or_hands_over_work(self):
+        cron = self.cron_context()
+        refused = [
+            {'action': 'work_on', 'issue': 'ABC-1', 'id': str(uuid.uuid4())},
+            {'action': 'take_over', 'issue': 'ABC-1', 'id': str(uuid.uuid4())},
+            {'action': 'resume_owner', 'issue': 'ABC-1', 'id': str(uuid.uuid4())},
+            {'action': 'hand_off', 'issue': 'ABC-1', 'to': 'peer', 'id': str(uuid.uuid4())},
+            {'action': 'track', 'issue': 'ABC-1', 'task_id': 't_1'},
+            {'action': 'followup', 'issue': 'ABC-1', 'body': 'go', 'id': str(uuid.uuid4())},
+            {'action': 'delegate_self', 'issue': 'ABC-1', 'id': str(uuid.uuid4()), 'expected_delegate_id': None,
+             'expected_updated_at': 'x', 'expected_binding_revision': 'y'},
+            {'action': 'create_project', 'name': 'P', 'team': 'team-1', 'id': str(uuid.uuid4())},
+            {'action': 'create_issue', 'title': 'T', 'team': 'team-1', 'project': 'none', 'start_work': True,
+             'id': str(uuid.uuid4())},
+            {'action': 'create_issue', 'title': 'T', 'team': 'team-1', 'project': 'none', 'record_done': True,
+             'summary': 'done', 'id': str(uuid.uuid4())},
+            # Only an explicit boolean false counts as "no work"; anything else is refused before any read.
+            {'action': 'create_issue', 'title': 'T', 'team': 'team-1', 'project': 'none', 'start_work': 'false',
+             'id': str(uuid.uuid4())},
+        ]
+        before = len(self.remote.requests)
+        for args in refused:
+            with self.subTest(args=args):
+                reply = json.loads(chat.handle(self.bridge, args, cron))
+                self.assertFalse(reply['ok'], reply)
+                self.assertEqual(reply['code'], 'cron_scope_refused')
+                self.assertIn('Nothing was changed', reply['message'])
+                if args.get('id'):
+                    self.assertIsNone(self.store.outbox_row(args['id']))
+        self.assertEqual(self.remote.requests[before:], [])  # refused before any Linear read or write
+        self.assertEqual(set(self.remote.issues), {'issue-1'})
+        # A chat context with the same arguments is unaffected by the cron gate.
+        for args in refused:
+            self.assertIsNone(chat.cron_refusal(args, args['action'], self.context))
+
+    def test_cron_shaped_session_key_alone_is_still_gated(self):
+        # Defence in depth: a context naming the scheduler's run key is gated even off the cron platform.
+        shaped = replace(self.context, session_key='cron:job1:exec1')
+        reply = json.loads(chat.handle(self.bridge, {'action': 'work_on', 'issue': 'ABC-1', 'id': str(uuid.uuid4())}, shaped))
+        self.assertEqual(reply['code'], 'cron_scope_refused')
+
     def test_editor_escapes_bullets_and_whitespace_match_outside_code(self):
         from hermes_fleet_linear_plugin.api import markdown_matches
         for expected, actual in (
