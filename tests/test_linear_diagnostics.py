@@ -440,6 +440,31 @@ class BridgePathTests(DiagCase):
                         settings={"ingress_profile": "alpha"})
         return bridge, store
 
+    def test_one_webhook_delivery_is_routed_once_while_it_waits_for_its_commit(self) -> None:
+        # HF-823: HF-813 event bfed45f8 was logged as routed 13 times in 4 s. The delivery stays
+        # pending until native input commits it, so every drain hands it over again; only the first
+        # hand-over is routing. A failed hand-over routes it anew on the retry.
+        from linear_ingress_fixture import IngressStore, Route
+        bridge, _store = self.make(Api())
+        inbox = Path(tempfile.mkdtemp(dir=self.enterContext(tempfile.TemporaryDirectory()))) / "ingress.db"
+        route = Route("agent-a", "alpha", "/webhook/alpha", inbox.parent / "unused", inbox)
+        event = {"type": "AgentSessionEvent", "action": "created", "webhookId": "evt-1",
+                 "agentSession": {"id": "sess-1", "issue": {"id": ISSUE}}}
+        IngressStore(inbox).enqueue(route, "evt-1", json.dumps(event).encode())
+        calls, outcomes = [], [True, True, LinearError("receiver interrupted"), True, True]
+        def native(delivery):
+            calls.append(delivery.delivery_id)
+            outcome = outcomes.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+        bridge.native_ingress = native
+        for _ in range(5):
+            bridge.drain_ingress(inbox, retry_now=True)
+        self.assertEqual(calls, ["evt-1"] * 5)  # still offered each drain: the receiver keeps one submission
+        routed = [line for line in self.capture.lines() if "outcome=routed" in line and "reason=native_routed" in line]
+        self.assertEqual(len(routed), 2, routed)  # once, then once more after the failed hand-over
+
     def test_failed_comment_logs_metadata_only_and_keeps_reason_on_row(self) -> None:
         bridge, store = self.make(Api(fail_comment=True))
         row_id = store.enqueue("comment", {"issue_id": ISSUE, "body": BODY, "content_action": True,

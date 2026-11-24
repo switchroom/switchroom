@@ -162,12 +162,13 @@ class FinishedThroughTheBridgeTests(unittest.TestCase):
         self.bridge._finished(self.store.get(ISSUE), event_id=2)
         self.bridge.flush()
         update = self.sent()["projectUpdateCreate"]
-        self.assertEqual(update["body"], "Agent update\n\n" + _update_line("OPS-1", "Done.\n\n" + HF_612_READABLE))
+        # HF-823: the closing note and its project line keep the paths the worker named.
+        self.assertEqual(update["body"], "Agent update\n\n" + _update_line("OPS-1", "Done.\n\n" + HF_612_RAW))
         self.assertIn("\n  2. 1330.1 MiB", update["body"])
         self.assertIs(update["isDiffHidden"], True)
         self.assertNotIn("health", update)
         closing = self.sent()["commentCreate"]
-        self.assertEqual(closing["body"], "Done.\n\n" + HF_612_READABLE)
+        self.assertEqual(closing["body"], "Done.\n\n" + HF_612_RAW)
         self.assertNotIn("parentId", closing)
         receipt = self.authority.comment_records[closing["id"]]
         self.assertIsNone(receipt["parent"])

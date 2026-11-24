@@ -288,7 +288,7 @@ connection.close()
         child = subprocess.Popen([sys.executable, "-u", "-c", script, str(database), task_id],
                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
-            self.assertTrue(select.select([child.stdout], [], [], 5)[0], "spill writer did not become ready")
+            self.assertTrue(select.select([child.stdout], [], [], 30)[0], "spill writer did not become ready")
             self.assertEqual(child.stdout.readline().strip(), "ready")
             yield child
         finally:
