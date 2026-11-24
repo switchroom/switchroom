@@ -65,6 +65,23 @@ def native_board_names() -> list[str]:
     except Exception:  # noqa: BLE001 - a status view without core still lists the outbox
         return []
 
+def native_board_of(path: Path) -> str | None:
+    """The board whose own database ``path`` is, by core's layout, or None.
+
+    A Kanban worker shell pins HERMES_KANBAN_DB, so core resolves every board name to that one
+    file (the fence that keeps workers on their own board). Status reads it once and labels it
+    with the board it belongs to, not with each name that resolved to it."""
+    try:
+        from hermes_cli import kanban_db
+        path = Path(path).resolve()
+        if path == (kanban_db.kanban_home() / "kanban.db").resolve():
+            return "default"
+        if path.name == "kanban.db" and path.parent.parent == kanban_db.boards_root().resolve():
+            return path.parent.name
+    except Exception:  # noqa: BLE001 - the first name that resolved to it labels it instead
+        pass
+    return None
+
 def _park(native: sqlite3.Connection, task_id: str, now: float) -> tuple[float, str, bool] | None:
     """(parked at, why, stuck) for a task whose standing block is a wait the gateway resumes, else None."""
     task = _rows(native, "SELECT status FROM tasks WHERE id = ?", task_id)
@@ -89,15 +106,17 @@ def _park(native: sqlite3.Connection, task_id: str, now: float) -> tuple[float, 
     return since, f"parked on {what}", False
 
 def _parks(db: sqlite3.Connection, boards: Callable[[str], Path | None], now: float, add,
-           board_names: Callable[[], list[str]] | None = None) -> None:
+           board_names: Callable[[], list[str]] | None = None, profile: str | None = None,
+           board_of: Callable[[Path], str | None] | None = None) -> None:
     """Tasks parked on CI or a dependency: in progress inside the window, an operator item past it.
 
     The gateway rechecks a CI park every two minutes and resumes it once CI on its head finishes or
     its window passes, so a CI park still blocked PARK_GRACE past its window is stuck. A dependency
     park with no CI gate has no window of its own; it counts as stuck past waits.CI_MAX_WINDOW.
     Bound tasks are listed under their issue. With ``board_names``, every other blocked or triaged
-    task on those boards is checked too (HF-827): the gateway resumes its park the same way, and
-    one it did not resume is listed with no issue."""
+    task assigned to ``profile`` on those boards is checked too (HF-827): this gateway resumes
+    exactly those, and one it did not resume is listed with no issue. Each database is read once,
+    however many board names resolve to it (a pinned HERMES_KANBAN_DB), under its own board."""
     bound: dict[str, list[tuple[str, str]]] = {}
     bound_ids: set[str] = {row["task_id"] for row in _rows(db, "SELECT task_id FROM work") if row["task_id"]}
     for row in _rows(db, "SELECT m.value, w.task_id FROM metadata m JOIN work w ON m.key = 'native-binding:' || w.issue_id "
@@ -108,22 +127,30 @@ def _parks(db: sqlite3.Connection, boards: Callable[[str], Path | None], now: fl
             continue
         if isinstance(binding, dict) and binding.get("task_id") == row["task_id"]:
             bound.setdefault(str(binding.get("board") or "default"), []).append((binding.get("issue_id") or "", row["task_id"]))
-    names = sorted(set(bound) | set(board_names() if board_names is not None else ()))
-    for board in names:
+    unbound = sorted(set(board_names()) if board_names is not None and profile else ())
+    databases: dict[Path, dict[str, Any]] = {}
+    for board in sorted(set(bound) | set(unbound)):
         path = boards(board)
         if path is None or not path.is_file():
             continue
-        with closing(_read(path)) as native:
-            tasks = list(bound.get(board, ()))
-            if board_names is not None:
+        seen = databases.setdefault(path.resolve(), {"path": path, "names": [], "bound": [], "scan": False})
+        seen["names"].append(board)
+        seen["bound"] += bound.get(board, ())
+        seen["scan"] = seen["scan"] or board in unbound
+    for found_at, seen in databases.items():
+        label = (board_of or native_board_of)(found_at) or seen["names"][0]
+        with closing(_read(seen["path"])) as native:
+            tasks = list(dict.fromkeys(seen["bound"]))
+            if seen["scan"]:
                 tasks += [("", row["id"]) for row in _rows(native, "SELECT id FROM tasks WHERE status IN ('blocked', 'triage') "
-                                                                    "ORDER BY id") if row["id"] not in bound_ids]
+                                                                    "AND assignee = ? ORDER BY id", profile)
+                          if row["id"] not in bound_ids]
             for issue, task_id in tasks:
                 found = _park(native, task_id, now)
                 if found is None:
                     continue
                 since, why, late = found
-                ref = task_id if issue else f"{board}:{task_id}"
+                ref = task_id if issue else f"{label}:{task_id}"
                 if not issue:
                     why += " (no Linear issue)"
                 add(issue, ref, since, why, STUCK_PARK if late else "Resumes by itself when that is done.", late)
@@ -207,7 +234,7 @@ def _scan(state: Path, ingress: Path, profile: str, now: float | None = None, *,
                     f"native {request.get('kind') or 'delivery'} outcome needs reconciliation",
                     "Inspect native task/comment/run and external state. Reuse the original request; never blindly replay.", True)
             if boards is not None:
-                _parks(db, boards, now, add, board_names)
+                _parks(db, boards, now, add, board_names, profile)
     if ingress.is_file():
         with closing(_read(ingress)) as db:
             for row in _rows(db, "SELECT logical_agent, delivery_id, payload, received_at, status, attempts FROM deliveries WHERE "
