@@ -644,8 +644,16 @@ statuses over `gh api repos/...` (so per-owner token routing applies), and once 
 finished or the window has passed it writes a native `CI verdict: passed | failed | timed out`
 comment with one line per run, then makes one plain unblock while that comment is the only
 event since the block. A Stop or answer that lands first wins, and the comment stays as
-information. A repeated park on the same task lands in triage through core's block-loop breaker;
-it carries the same wait and resumes the same way, up to 20 CI parks per task.
+information. Up to 20 CI parks per task resume this way.
+
+These waits are quiet (HF-850). Where Core has the `kanban_wait_claim` hook, the plugin claims each
+CI, delivery-gate or issue wait on this profile's own task as the worker writes it; Core records it
+as a board hold (`source: external_wait`): no "blocked; needs attention" chat ping, no wake of the
+orchestrator, and no count toward the block-loop breaker, so repeated parks never reach triage.
+Linear still shows the wait and the verdict. A real question, a dependency block naming nothing
+checkable, the 21st CI park on a task and every wait under `specialist_scope` are not claimed and
+alert as before. On a Core without the hook a repeated park lands in triage through the block-loop
+breaker and resumes the same way.
 
 A park on a task no Linear issue is bound to (HF-827), such as a follow-up the agent created
 itself, resumes the same way: once a minute the plugin reads this profile's blocked and triaged

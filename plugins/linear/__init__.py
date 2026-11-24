@@ -11,7 +11,7 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable
-from . import api as api_module, chat, ops
+from . import api as api_module, chat, ops, waits
 from .api import ENDPOINT, LinearAPI, LinearError, RateLimited, backoff_delay
 from .bridge import Bridge, Kanban, file_signature, validate_activation_cutoff_ms, validate_ingress_profile
 from .oauth import ReauthorizationRequired, token_provider
@@ -701,6 +701,8 @@ def register(ctx: Any) -> None:
         ctx.register_hook(event, native_hint)
     # Kanban chat pings name a tracked task as its linked Linear issue (Core kanban_task_link).
     chat.register_task_link(ctx, lambda: paths()[0])
+    # A worker's CI / issue / delivery wait this bridge resumes is quiet board state (Core kanban_wait_claim).
+    waits.register_wait_claim(ctx)
 
     stop_requested = threading.Event()
 
