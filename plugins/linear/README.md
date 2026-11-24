@@ -45,10 +45,16 @@ Creates read the new issue or project back under its UUID. Linear's editor rewri
 it stores it: it backslash-escapes punctuation such as `~`, writes `*` for `-` bullets and drops
 trailing spaces and repeated blank lines. Outside code those count as the same text. A new
 issue's description also comes back with a bare URL or host/path the author wrote autolinked
-(`[T](<T>)`, or `[T](<http://T>)` for a host), with bold split around inline code, and with
-bold closed before a link that ends it (`**see [X](u)**` comes back `**see** [X](u)`); the
-create readback accepts exactly those, with the same token, the same link label and target,
-and the same bold prose characters. Description and comment writes still settle on the stricter comparison. A create
+(`[T](<T>)`, `[T](<http://T>)` for a host, `[T](<mailto:T>)` for an email address), with bold
+split around inline code, with bold closed before a link that ends it (`**see [X](u)**` comes
+back `**see** [X](u)`), with plain-text square brackets escaped (`[DONE]` comes back
+`\[DONE\]`, never where that would make or unmake a link), with a link target in angle
+brackets on a line that also holds inline code, and with a wrapped line of a list item
+re-indented to the item's text column. The create readback accepts exactly those, with the
+same token, the same link label and target, the same bold prose characters and the same words.
+On a same-id replay, this app as delegate is expected (the first create's `start_work` set it);
+any other delegate, or a delegate on a first create, still differs. Description and comment
+writes still settle on the stricter comparison. A create
 whose readback still differs is reported as created, with `readback_differences` naming the
 fields and a `content.write` `readback_differs` warning (`fields=` names them); it is never refused, because a refusal
 invites a retry under a new id, which is how duplicates happen. Escapes that change structure
@@ -554,7 +560,10 @@ Linear-origin task creation. `api_url`, `tick_seconds` (default 2), `team_states
 `completion_contracts` retain their existing meanings. `tick_seconds` is the gap while the
 reporting loop has work; each tick that did nothing (no counted outcome, no Linear request)
 doubles the gap up to 15 s. A write to the webhook inbox ends the wait at once and is also
-drained between bindings of a long pass, so a webhook never waits out a full pass; a write to a
+drained between bindings of a long pass, so a webhook never waits out a full pass. Each thread
+keeps one connection to the inbox, and the plugin adds an index of pending rows to it
+(`deliveries_pending_by_profile`, created if missing), so a drain reads only pending
+deliveries, not every filed payload the inbox still keeps; a write to a
 bound native board ends it no sooner than `tick_seconds`. A done, blocked or triage binding whose
 last full pump changed nothing is skipped until the store or its board changes, or for at most
 60 s; running work is always pumped. A `linear` tool call wakes the loop, so its queued writes
@@ -661,8 +670,10 @@ happened. The summary splits tick time: `max_tick_ms` is the slowest tick, `max_
 the most time one tick spent inside Linear requests (request lock, credentials, HTTP),
 `max_tick_wait_ms` the most it spent blocked on a per-issue lock or the store's write lock held
 by another thread or process, `max_tick_local_ms` the most of its own work,
-`max_tick_local_cpu_ms` the most of that own work the thread was actually running (the rest is
-off-CPU: waiting for the interpreter lock other gateway threads hold, or for disk), and
+`max_tick_local_cpu_ms` the most of that own work the thread was actually running and
+`max_tick_local_offcpu_ms` the most of it off-CPU (waiting for the interpreter lock other
+gateway threads hold, or for disk), `max_tick_external_ms` the most it spent waiting on a
+service other than Linear (the native runtime's RPC for a worker's live step, the GitHub CLI), and
 `max_tick_api_calls` / `n_api_calls` the most HTTP requests in one tick and the total. Chat-tool
 requests on other threads are not counted. A WARNING repeats at most once per 15 minutes per issue and reason, and the next one
 carries `suppressed=N`. A refusal that is re-evaluated repeats at most once per hour. Each

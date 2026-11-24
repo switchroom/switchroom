@@ -135,6 +135,59 @@ class IngressBindingTests(unittest.TestCase):
         with closing(sqlite3.connect(self.inbox)) as db:
             self.assertEqual(db.execute("SELECT status, attempts FROM deliveries").fetchone(), ("imported", 1))
 
+    def test_drains_reuse_one_connection_and_read_pending_rows_by_index(self):
+        """HF-755: a drain neither reconnects nor scans every filed payload."""
+        from hermes_fleet_linear_plugin import bridge as bridge_module
+        self.enqueue("default", "first")
+        bridge = self.bridge()
+        bridge.drain_ingress(self.inbox)
+        connection = bridge_module._ingress_local.connection[1]
+        self.enqueue("default", "second")
+        bridge.drain_ingress(self.inbox)
+        self.bridge().drain_ingress(self.inbox)  # another bridge on this thread shares it too
+        self.assertIs(bridge_module._ingress_local.connection[1], connection)
+        self.assertEqual(self.statuses(), {"first": "imported", "second": "imported"})
+        with closing(sqlite3.connect(self.inbox)) as db:
+            plan = " ".join(row[-1] for row in db.execute(
+                "EXPLAIN QUERY PLAN SELECT payload FROM deliveries WHERE profile = ? AND status = 'pending' "
+                "ORDER BY received_at, delivery_id", ("default",)))
+        self.assertIn("deliveries_pending_by_profile", plan)
+        self.assertNotIn("SCAN deliveries", plan)
+
+    def test_a_replaced_inbox_or_failed_drain_gets_a_new_connection(self):
+        from unittest.mock import patch
+        from hermes_fleet_linear_plugin import bridge as bridge_module
+        bridge = self.bridge()
+        self.enqueue("default", "first")
+        bridge.drain_ingress(self.inbox)
+        first = bridge_module._ingress_local.connection[1]
+        self.inbox.unlink()
+        for suffix in ("-wal", "-shm"):
+            Path(str(self.inbox) + suffix).unlink(missing_ok=True)
+        self.producer = IngressStore(self.inbox)
+        self.enqueue("default", "after-replace")
+        bridge.drain_ingress(self.inbox)
+        self.assertEqual(self.statuses(), {"after-replace": "imported"})
+        second = bridge_module._ingress_local.connection[1]
+        self.assertIsNot(first, second)
+        with self.assertRaises(sqlite3.ProgrammingError):
+            first.execute("SELECT 1")  # the old file's connection was closed, not leaked
+        self.enqueue("default", "later")
+        with patch.object(bridge, "_stop_deliveries", side_effect=sqlite3.OperationalError("disk I/O error")):
+            with self.assertRaises(sqlite3.OperationalError):
+                bridge.drain_ingress(self.inbox)
+        self.assertIsNone(bridge_module._ingress_local.connection)
+        bridge.drain_ingress(self.inbox)
+        self.assertEqual(self.statuses(), {"after-replace": "imported", "later": "imported"})
+
+    def test_an_inbox_that_cannot_take_the_index_still_drains(self):
+        from unittest.mock import patch
+        from hermes_fleet_linear_plugin import bridge as bridge_module
+        self.enqueue("default", "only")
+        with patch.object(bridge_module, "INGRESS_PENDING_INDEX", "CREATE INDEX broken ON missing_table (x)"):
+            self.bridge().drain_ingress(self.inbox)
+        self.assertEqual(self.statuses(), {"only": "imported"})
+
     def test_cli_route_uses_explicit_ingress_or_native_profile_never_deployment_env(self):
         import os
         import sys

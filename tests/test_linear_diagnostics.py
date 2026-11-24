@@ -371,6 +371,51 @@ class TickTimingTests(DiagCase):
         self.assertEqual((values["max_tick_ms"], values["max_tick_api_ms"], values["max_tick_local_ms"],
                           values["max_tick_local_cpu_ms"]), (4000, 1000, 3000, 500))
 
+    def test_off_cpu_local_time_and_other_services_are_their_own_counters(self) -> None:
+        """local = local_cpu + local_offcpu; a native-runtime or GitHub wait is external, not local."""
+        started = self.now[0]
+        diag.tick_begin()
+        self.now[0] += 1.0
+        self.cpu[0] += 0.25        # own work running
+        with diag.external_time():  # waiting on the native runtime or the GitHub CLI
+            self.now[0] += 3.0
+            self.cpu[0] += 0.5     # the CPU of that exchange belongs to it, not to local
+        self.now[0] += 0.5         # runnable but not running
+        diag.tick_done(started)
+        self.flush_summary()
+        values = self.summary()
+        self.assertEqual((values["max_tick_ms"], values["max_tick_external_ms"], values["max_tick_local_ms"],
+                          values["max_tick_local_cpu_ms"], values["max_tick_local_offcpu_ms"]),
+                         (4500, 3000, 1500, 250, 1250))
+
+    def test_a_linear_request_inside_an_external_wait_is_counted_once(self) -> None:
+        api = self.api(seconds=2.0)
+        started = self.now[0]
+        diag.tick_begin()
+        with diag.external_time():
+            self.now[0] += 1.0
+            api.graphql("query Viewer { viewer { id } }")  # nested: the outer wait already holds it
+        diag.tick_done(started)
+        self.flush_summary()
+        values = self.summary()
+        self.assertEqual((values["max_tick_ms"], values["max_tick_external_ms"], values["max_tick_api_ms"],
+                          values["max_tick_local_ms"]), (3000, 3000, 0, 0))
+
+    def test_github_cli_reads_are_external_time(self) -> None:
+        import subprocess
+        from hermes_fleet_linear_plugin import acceptance
+        def run(*args, **kwargs):
+            self.now[0] += 2.0
+            return subprocess.CompletedProcess(args, 0, stdout="{}", stderr="")
+        started = self.now[0]
+        diag.tick_begin()
+        with patch.object(acceptance.subprocess, "run", side_effect=run):
+            self.assertEqual(acceptance.gh_api("repos/o/r/pulls/1"), {})
+        diag.tick_done(started)
+        self.flush_summary()
+        values = self.summary()
+        self.assertEqual((values["max_tick_external_ms"], values["max_tick_local_ms"]), (2000, 0))
+
     def test_local_cpu_never_exceeds_local_time(self) -> None:
         started = self.now[0]
         diag.tick_begin()

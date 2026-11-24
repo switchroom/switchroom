@@ -10,7 +10,7 @@ import json
 from pathlib import Path
 import sqlite3
 
-from . import origin
+from . import diag, origin
 from .api import LinearError
 from .transport import Unavailable
 
@@ -79,7 +79,8 @@ def current(adapter, task):
             run = asyncio.run
         else:
             from model_tools import _run_async as run
-        return run(_read(Path(home), adapter, task, session_id))
+        with diag.external_time():  # waiting on the native runtime, not the reporting tick's own work
+            return run(_read(Path(home), adapter, task, session_id))
     except (Unavailable, RuntimeError, OSError, ValueError, ImportError, KeyError, TypeError, sqlite3.DatabaseError):
         return None  # Optional status cannot hold ordinary work or reporting.
 

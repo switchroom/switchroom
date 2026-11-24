@@ -417,6 +417,17 @@ class CreateReadbackTests(unittest.TestCase):
         # The other live create: a blank line added between a paragraph and the checklist under it.
         "blank_line_before_list": ("## Phase\nDo this first.\n- [ ] one\n- [ ] two",
                                    "## Phase\n\nDo this first.\n\n- [ ] one\n- [ ] two"),
+        # Synthetic reductions of the creates flagged after round 3 (2026-11-21 to 11-24).
+        "email_autolink": ("Ask the owner (ops@a.example) first.",
+                           "Ask the owner ([ops@a.example](<mailto:ops@a.example>)) first."),
+        "bracket_text_escaped": ("Every run answered [QUIET], then stopped.",
+                                 "Every run answered \\[QUIET\\], then stopped."),
+        "open_bracket_escaped_beside_link": ('- [ ] after [OPS-9](https://a.example/i/OPS-9), no "[Ping" lines',
+                                             '- [ ] after [OPS-9](https://a.example/i/OPS-9), no "\\[Ping" lines'),
+        "list_continuation_reindented": ("1. Do this:\n   - first part\n   still the first part\n2. Then",
+                                         "1. Do this:\n   * first part\n     still the first part\n2. Then"),
+        "angle_link_on_code_line": ("- `tool status` waits on [OPS-9](https://a.example/i/OPS-9) today",
+                                    "* `tool status` waits on [OPS-9](<https://a.example/i/OPS-9>) today"),
     }
     REJECTED = {
         "bold_removed": ("**NOT** this", "NOT this"),
@@ -456,6 +467,29 @@ class CreateReadbackTests(unittest.TestCase):
                                  "a **[OPS-9](https://a.example/i/OPS-9)** b"),
         "bold_only_link_beside_code_dropped": ("**`v1` [OPS-9](https://a.example/i/OPS-9)**",
                                                "`v1` [OPS-9](https://a.example/i/OPS-9)"),
+        # Email autolinks: only the authored address, as mailto, and only where it was bare.
+        "email_other_address": ("Ask ops@a.example", "Ask [ops@a.example](<mailto:dev@a.example>)"),
+        "email_other_label": ("Ask ops@a.example", "Ask [dev@a.example](<mailto:dev@a.example>)"),
+        "email_not_mailto": ("Ask ops@a.example", "Ask [ops@a.example](<https://ops@a.example>)"),
+        "email_in_code": ("Ask `ops@a.example`", "Ask `[ops@a.example](<mailto:ops@a.example>)`"),
+        "email_changed_word": ("Ask ops@a.example now", "Tell [ops@a.example](<mailto:ops@a.example>) now"),
+        # Escaped brackets: plain text only, never a link, reference or definition.
+        "escaped_label_was_link": ("see [docs](https://a.example/x)", "see \\[docs\\](https://a.example/x)"),
+        "link_became_escaped_text": ("see [docs][ref]", "see \\[docs\\]\\[ref\\]"),
+        "definition_escaped": ("[ref]: https://a.example/x", "\\[ref\\]: https://a.example/x"),
+        "escape_makes_new_link": ("see [x\\](y) now", "see \\[x\\](y) now"),
+        "bracket_text_changed": ("answered [QUIET] then", "answered \\[LOUD\\] then"),
+        "bracket_in_code": ("run `[QUIET]` now", "run `\\[QUIET\\]` now"),
+        # List continuations: the indent of a wrapped line only, never its text or a block start.
+        "continuation_word_changed": ("- first part\n  still first", "* first part\n    still second"),
+        "continuation_after_blank": ("- first part\n\n      code block", "* first part\n\n  code block"),
+        "continuation_became_item": ("- first part\n  more", "* first part\n  * more"),
+        "continuation_in_fence": ("- a\n```\n  x\n```", "* a\n```\n    x\n```"),
+        "continuation_became_heading": ("- first part\n  # not a heading", "* first part\n# not a heading"),
+        # Angle brackets on a link target: the same target only, and code stays exact.
+        "angle_link_target_changed": ("`x` at [OPS-9](https://a.example/i/OPS-9)",
+                                      "`x` at [OPS-9](<https://a.example/i/OPS-8>)"),
+        "angle_link_inside_code": ("run `[OPS-9](https://a.example/i)`", "run `[OPS-9](<https://a.example/i>)`"),
     }
 
     def test_linear_rewrites_on_create_compare_equal(self):
@@ -471,7 +505,8 @@ class CreateReadbackTests(unittest.TestCase):
 
     def test_settlement_comparator_stays_strict(self):
         for name in ("full_url", "bare_host_path", "bold_split_around_code", "bold_closed_before_link",
-                     "bold_opened_after_link"):
+                     "bold_opened_after_link", "email_autolink", "bracket_text_escaped",
+                     "open_bracket_escaped_beside_link", "list_continuation_reindented", "angle_link_on_code_line"):
             authored, stored = self.ACCEPTED[name]
             with self.subTest(name):
                 self.assertFalse(api.markdown_matches(stored, authored))
