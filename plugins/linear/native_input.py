@@ -1790,12 +1790,22 @@ def create_adapter(config, running):
     return LinearAdapter()
 
 
+def _no_home_channel():
+    """An Agent Session is an issue thread, not a chat to nominate: ask Core not to send its
+    one-time "no home channel, type /sethome" prompt there. A Core without the capability
+    (``PlatformEntry`` lacks the field and would refuse the keyword) keeps working unchanged."""
+    from gateway.platform_registry import PlatformEntry
+    fields = getattr(PlatformEntry, "__dataclass_fields__", {})
+    return {"has_home_channel": False} if "has_home_channel" in fields else {}
+
+
 def register_platform(ctx, running):
     """Register once; native platform config remains the opt-in and allowlist."""
     ctx.register_platform(
         "linear", "Linear", lambda config: create_adapter(config, running), native_supported,
         allowed_users_env="LINEAR_ALLOWED_USERS",
         install_hint="Use a Core release with the shared session runtime (admission ledger).",
+        **_no_home_channel(),
     )
     from hermes_cli.config import load_config_readonly
     platforms = (load_config_readonly() or {}).get("platforms") or {}

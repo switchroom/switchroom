@@ -187,6 +187,33 @@ class DelegationEntryScenarios(unittest.IsolatedAsyncioTestCase):
             self.bridge.flush()
 
     # -- scenarios -------------------------------------------------------
+    async def test_a_person_in_an_agent_session_never_gets_the_set_home_channel_prompt(self):
+        # HF-839: Core's one-time "No home channel is set for Linear... Type /sethome" nudge reached a
+        # person's Agent Session as a thought. The registered Linear platform declares it has no home
+        # channel, so Core's real first-contact path sends nothing there; a chat platform still gets it.
+        from unittest.mock import AsyncMock
+        from gateway.config import GatewayConfig, Platform
+        from gateway.platform_registry import platform_registry
+        from gateway.run import GatewayRunner
+        from gateway.session import SessionSource, SessionStore
+        self.assertIs(platform_registry.get("linear").has_home_channel, False)
+        def first_contact(platform):
+            runner = GatewayRunner.__new__(GatewayRunner)
+            runner.config = GatewayConfig()
+            runner.session_store = SessionStore(sessions_dir=self.home / "sessions", config=runner.config)
+            runner._deliver_platform_notice = AsyncMock()
+            source = SessionSource(platform=platform, chat_id=ISSUE, user_id=USER, chat_type="dm")
+            return runner, runner._hmwa_first_contact_notes(source, [], [])
+        runner, turn = first_contact(Platform("linear"))
+        await turn
+        self.assertEqual(runner._deliver_platform_notice.await_args_list, [])
+        with patch.dict(os.environ, {"TELEGRAM_HOME_CHANNEL": ""}):  # counterexample: the check is live
+            runner, turn = first_contact(Platform.TELEGRAM)
+            await turn
+        notices = runner._deliver_platform_notice.await_args_list
+        self.assertEqual(len(notices), 1)
+        self.assertIn("/sethome", notices[0].args[1])
+
     async def test_delegation_without_prompt_starts_one_tracked_task_before_the_model_turn(self):
         remember, parked = self.bridge.store.remember_conversation_input, []
         def at_commit(*args, **kwargs):  # no worker can start before this session's input commits
