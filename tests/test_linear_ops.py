@@ -25,6 +25,11 @@ class LinearOperatorTests(unittest.TestCase):
         self.home = Path(tmp.name)
         self.state, self.inbox = self.home / "state.db", self.home / "ingress.db"
         self.store = Store(self.state)
+        # The CLI reads real native boards where core is importable; keep these tests on fixtures (HF-827).
+        for name, fake in (("native_boards", lambda board: None), ("native_board_names", lambda: [])):
+            patcher = patch.object(ops, name, fake)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def cli(self, *argv):
         parser = argparse.ArgumentParser()
@@ -202,14 +207,14 @@ class LinearOperatorTests(unittest.TestCase):
 
     # HF-823: a CI or dependency park the gateway never resumed is an operator item.
     def board(self, *tasks):
-        """A native board with core's two tables: (task_id, status, [(kind, payload, created_at), ...])."""
+        """A native board with core's two tables: (task_id, status, [(kind, payload, created_at), ...][, assignee])."""
         path = self.home / "board.db"
         with closing(sqlite3.connect(path)) as db:
-            db.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT NOT NULL)")
+            db.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT NOT NULL, assignee TEXT)")
             db.execute("CREATE TABLE task_events (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, kind TEXT, "
                        "payload TEXT, created_at INTEGER)")
-            for task_id, status, events in tasks:
-                db.execute("INSERT INTO tasks VALUES (?,?)", (task_id, status))
+            for task_id, status, events, *assignee in tasks:
+                db.execute("INSERT INTO tasks VALUES (?,?,?)", (task_id, status, (assignee or ["default"])[0]))
                 for kind, payload, at in events:
                     db.execute("INSERT INTO task_events (task_id,kind,payload,created_at) VALUES (?,?,?,?)",
                                (task_id, kind, json.dumps(payload) if payload is not None else None, at))
@@ -261,6 +266,65 @@ class LinearOperatorTests(unittest.TestCase):
         self.assertIn("ACT issue-p0 [t_p0]", out)
         # Without a readable board the outbox view still works.
         self.assertEqual(ops.stuck(self.state, self.inbox, "default", now=now, boards=lambda board: None), [])
+
+    # HF-827: a park on a task no Linear issue is bound to is listed too, under its board.
+    def test_unbound_park_past_its_window_needs_an_operator(self):
+        ci = self.parked_on("CI gate: https://github.com/o/r/pull/7 within 90m")
+        self.store.bind_native("issue-b0", "t_b0", "default", "work", at=0)
+        boards = self.board(("t_b0", "blocked", [("blocked", ci, 0)]),  # bound: listed once, under its issue
+                            ("t_u0", "blocked", [("blocked", ci, 0), ("worker_result", {"exit_code": 130}, 1)]),
+                            ("t_u1", "blocked", [("blocked", self.parked_on("CI gate: o/r@" + "a" * 40), 0)]),
+                            ("t_u2", "blocked", [("blocked", {"reason": "need a decision", "kind": "needs_input"}, 0)]),
+                            ("t_u3", "ready", [("blocked", ci, 0), ("unblocked", None, 10)]),
+                            # another profile's park: this gateway never resumes it, so it is not flagged here
+                            ("t_u4", "blocked", [("blocked", ci, 0)], "coder"))
+        now = 90 * 60 + 15 * 60 + 1
+        names = lambda: ["default", "work"]  # noqa: E731 - "default" has no board file here
+        items = {i["ref"]: i for i in ops.stuck(self.state, self.inbox, "default", now=now, boards=boards, board_names=names)}
+        self.assertEqual(sorted(items), ["t_b0", "work:t_u0", "work:t_u1"])
+        self.assertEqual(items["t_b0"]["issue"], "issue-b0")
+        self.assertTrue(items["work:t_u0"]["act"])
+        self.assertEqual(items["work:t_u0"]["issue"], "-")
+        self.assertIn("parked on CI and still blocked", items["work:t_u0"]["why"])
+        self.assertIn("no Linear issue", items["work:t_u0"]["why"])
+        self.assertFalse(items["work:t_u1"]["act"])  # default 3 h window: still in progress
+        # Without the board list (older callers) only bound tasks are read, as before.
+        self.assertEqual(sorted(i["ref"] for i in ops.stuck(self.state, self.inbox, "default", now=now, boards=boards)), ["t_b0"])
+        # The CLI scans every board, so the health check exits 1 for the unbound park.
+        with patch.object(ops, "native_boards", boards), patch.object(ops, "native_board_names", names):
+            with patch.object(ops.time, "time", return_value=now):
+                code, out = self.cli("status")
+        self.assertEqual(code, 1)
+        self.assertIn("ACT - [work:t_u0]", out)
+        # The other profile's gateway lists its own park.
+        theirs = ops.stuck(self.state, self.inbox, "coder", now=now, boards=boards, board_names=names)
+        self.assertEqual(sorted(i["ref"] for i in theirs), ["t_b0", "work:t_u4"])
+
+    # HF-827 review: a worker shell pins HERMES_KANBAN_DB, so core resolves every board name to one file.
+    def test_a_pinned_board_database_is_read_once_under_its_own_board(self):
+        ci = self.parked_on("CI gate: https://github.com/o/r/pull/7 within 90m")
+        path = self.board(("t_u0", "blocked", [("blocked", ci, 0)]))("work")
+        pinned = lambda board: path  # noqa: E731 - what kanban_db_path returns for every board under the pin
+        names = lambda: ["camofox", "default", "ops", "work"]  # noqa: E731
+        now = 90 * 60 + 15 * 60 + 1
+        own = lambda found: "work" if found == path.resolve() else None  # noqa: E731 - core's layout says whose it is
+        items = []
+        ops._parks(self.store_db(), pinned, now, lambda *a: items.append(a), names, "default", own)
+        self.assertEqual([item[1] for item in items], ["work:t_u0"])
+        # Unrecognised by the layout, it is still read once, under the first name that resolved to it.
+        items.clear()
+        ops._parks(self.store_db(), pinned, now, lambda *a: items.append(a), names, "default", lambda found: None)
+        self.assertEqual([item[1] for item in items], ["camofox:t_u0"])
+        # The public entry point does the same.
+        with patch.object(ops, "native_board_of", own):
+            refs = [i["ref"] for i in ops.stuck(self.state, self.inbox, "default", now=now, boards=pinned, board_names=names)]
+        self.assertEqual(refs, ["work:t_u0"])
+
+    def store_db(self):
+        db = sqlite3.connect(self.state)
+        db.row_factory = sqlite3.Row
+        self.addCleanup(db.close)
+        return db
 
 
 if __name__ == "__main__":

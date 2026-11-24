@@ -62,6 +62,7 @@ def standing_pr_park(events: list):
 # ``worker_result`` and a late heartbeat. Only events of the park's own run; anything else after
 # the park (a comment, Stop, answer, unblock or new block) still supersedes it.
 PARK_TRAIL = frozenset({"worker_result", "heartbeat"})
+UNBOUND_SCAN_GAP = 60.0  # seconds between local scans for parks on tasks no issue is bound to (HF-827)
 def park_trail(event, park) -> bool:
     """Whether ``event`` is the parking run winding down rather than something new."""
     return event.kind in PARK_TRAIL and park.run_id is not None and event.run_id == park.run_id
@@ -4066,6 +4067,9 @@ class Bridge:
         Stop that lands in between still wins. A second park on the same task trips core's
         block-loop breaker into triage; that ``block_loop_detected`` carries the same wait and
         resumes the same way, up to ``waits.CI_MAX_PARKS`` CI parks per task.
+
+        A park on a task no Linear issue is bound to is resumed the same way by
+        ``pump_unbound_waits`` (HF-827); only the report to Linear differs.
         """
         if not row or row.get("origin") != "native":
             return
@@ -4074,25 +4078,49 @@ class Bridge:
             return
         events = adapter.history(task.id, 0)
         last, wait = standing_wait(events)
-        if (last is None or wait is None or last.id > row["last_event_id"] or park_tail(events, last) is None
-                or task.status != ("triage" if last.kind == "block_loop_detected" else "blocked")):
+        if last is None or wait is None or last.id > row["last_event_id"]:
             return
         issue_id = row["issue_id"]
-        marker, fields = f"external-wait-resume:{issue_id}:{task.id}:{last.id}", {"iss": issue_id, "task": task.id, "evt": last.id}
+        outcome = self._settle_wait(adapter, task, events, last, wait, issue_id=issue_id,
+                                    scope=f"{issue_id}:{task.id}:{last.id}",
+                                    fields={"iss": issue_id, "task": task.id, "evt": last.id},
+                                    authorize=lambda: self.authorize_specialist_effect(issue_id))
+        if outcome is None:
+            return
+        verdict = outcome["verdict"]
+        body = "What this work waited on is done. The agent continues."
+        if verdict is not None:
+            targets = ", ".join(waits.ci_label(gate) for gate in wait["ci"])
+            body = f"CI {verdict['overall']} on {targets}. The agent continues with that result."
+        if row.get("owner_ref"):
+            self.activity(issue_id, row["owner_ref"], "thought", body, row=row)
+        else:
+            self.comment(issue_id, body, row=row)
+    def _settle_wait(self, adapter, task, events: list, last, wait: dict, *, issue_id: str | None, scope: str,
+                     fields: dict, authorize: Callable[[], bool]) -> dict | None:
+        """Decide one standing wait (see ``_resume_external_wait``); ``{"verdict": ...}`` once resumed, else None.
+
+        ``scope`` names the wait in its durable marker and recheck backoff; ``issue_id`` is the bound
+        issue (never waited on itself) or None for a task no issue is bound to.
+        """
+        if (park_tail(events, last) is None
+                or task.status != ("triage" if last.kind == "block_loop_detected" else "blocked")):
+            return None
+        marker = f"external-wait-resume:{scope}"
         if self.store.native_intent(marker):
-            return
-        key, now = f"external_wait_recheck:{issue_id}:{task.id}:{last.id}", self.clock()
+            return None
+        key, now = f"external_wait_recheck:{scope}", self.clock()
         if not self.store.backoff_ready(key, now):
-            return
+            return None
         gap = waits.CI_WAIT_GAP if wait["ci"] else waits.EXTERNAL_WAIT_GAP
         self.store.backoff_clear(key)
         self.store.backoff_fail(key, now, base=gap, cap=gap)
         if wait["ci"] and sum(1 for event in events if event.kind in ("blocked", "block_loop_detected")
                               and (waits.parse(native_event_payload(event)) or {}).get("ci")) > waits.CI_MAX_PARKS:
             diag.transition("external_wait.resume", "skipped", "ci_park_limit", key=marker, **fields)
-            return
-        if not self.authorize_specialist_effect(issue_id):
-            return  # Revoked or out of scope: the wait stays as it is for a person.
+            return None
+        if not authorize():
+            return None  # Revoked or out of scope: the wait stays as it is for a person.
         for ref in wait["issues"]:
             try:
                 other = self.api.issue(ref)
@@ -4100,25 +4128,25 @@ class Bridge:
                 raise
             except LinearError:
                 diag.transition("external_wait.resume", "skipped", "issue_unreadable", key=marker, **fields)
-                return
+                return None
             if other.get("id") != issue_id and (other.get("state") or {}).get("type") not in CLOSED:
                 diag.transition("external_wait.resume", "skipped", "issue_open", key=marker, **fields)
-                return
+                return None
         if not all(waits.gate_met(self.plugins_root, path, text) for path, text in wait["gates"]):
             diag.transition("external_wait.resume", "skipped", "delivery_pending", key=marker, **fields)
-            return
+            return None
         verdict = waits.ci_verdict(wait["ci"], float(last.created_at), now, ci_check) if wait["ci"] else None
         if wait["ci"] and verdict is None:
             diag.transition("external_wait.resume", "skipped", "ci_pending", key=marker, **fields)
-            return
+            return None
         latest = adapter.history(task.id, 0)
         tail = park_tail(latest, last)
         if adapter.require_task(task.id).status != task.status or tail is None:
             diag.transition("external_wait.resume", "skipped", "wait_changed", key=marker, **fields)
-            return
+            return None
         _, first = self.store.native_intent_prepare(marker, {"issue_id": issue_id, "task_id": task.id, "block_event_id": last.id})
         if not first:
-            return
+            return None
         token = tail.id
         try:
             if verdict is not None:
@@ -4129,26 +4157,69 @@ class Bridge:
                     # Something else happened beside the verdict (a Stop, an answer): it wins.
                     self.store.native_intent_settle(marker, {"state": "applied", "accepted": False})
                     diag.transition("external_wait.resume", "skipped", "wait_changed", key=marker, **fields)
-                    return
+                    return None
                 token = since[-1].id
             accepted = adapter.resume_wait(task.id, token)
         except Exception as exc:  # Uncertain: the marker stays unsettled and is never replayed.
             self.store.native_intent_settle(marker, {"state": "reconcile", "reason": type(exc).__name__})
             diag.warn("external_wait.resume", "failed", diag.exc_reason(exc), exc=type(exc).__name__, **fields)
-            return
+            return None
         self.store.native_intent_settle(marker, {"state": "applied", "accepted": bool(accepted),
                                                  **({"ci": verdict["overall"]} if verdict else {})})
-        if accepted:
-            body = "What this work waited on is done. The agent continues."
-            if verdict is not None:
-                targets = ", ".join(waits.ci_label(gate) for gate in wait["ci"])
-                body = f"CI {verdict['overall']} on {targets}. The agent continues with that result."
-            if row.get("owner_ref"):
-                self.activity(issue_id, row["owner_ref"], "thought", body, row=row)
-            else:
-                self.comment(issue_id, body, row=row)
         diag.transition("external_wait.resume", "applied" if accepted else "skipped",
                         "external_wait_resumed" if accepted else "wait_changed", key=marker, **fields)
+        return {"verdict": verdict} if accepted else None
+    def pump_unbound_waits(self) -> None:
+        """Resume parks on this agent's own tasks that no Linear issue is bound to (HF-827).
+
+        Workers park on CI (or a delivery gate, or other issues) on any native task, including
+        follow-ups they created themselves. The binding pump only sees bound tasks, so such a park
+        stayed blocked after its PR merged. One local read per board every UNBOUND_SCAN_GAP finds
+        this profile's blocked or triaged tasks with no work row; each standing wait is then decided
+        exactly as a bound one (same marker, backoff, verdict comment, guarded unblock, Stop wins).
+        Nothing is reported to Linear: there is no issue. Under a specialist scope a wait that names
+        other issues is left for a person, since nothing authorizes reading them.
+        """
+        profile = getattr(getattr(self, "kanban", None), "executor_profile", None)
+        if not profile:
+            return  # No verified native executor: nothing here may resume a task.
+        now = self.clock()
+        if now - self.__dict__.get("_unbound_scanned", -math.inf) < UNBOUND_SCAN_GAP:
+            return
+        self._unbound_scanned = now
+        try:
+            bound = {row.get("task_id") for row in self.store.active()}
+            boards = [meta["slug"] for meta in self.kanban.kb.list_boards(include_archived=False)]
+        except Exception as exc:  # noqa: BLE001 - the binding pump and flush still run
+            diag.warn("external_wait.resume", "held", diag.exc_reason(exc), kind="unbound_scan", exc=type(exc).__name__)
+            return
+        for slug in boards:
+            try:
+                adapter = self.kanban.for_board(slug)
+                with adapter.read_conn() as conn:
+                    parked = [row["id"] for row in conn.execute(
+                        "SELECT id FROM tasks WHERE status IN ('blocked', 'triage') AND assignee = ? ORDER BY id", (profile,))]
+            except Exception as exc:  # noqa: BLE001 - an unreadable or absent board holds only itself
+                diag.warn("external_wait.resume", "held", diag.exc_reason(exc), kind="unbound_scan", exc=type(exc).__name__)
+                continue
+            for task_id in parked:
+                if task_id in bound:
+                    continue  # The binding pump decides it and reports it on its issue.
+                try:
+                    task = adapter.require_task(task_id)
+                    events = adapter.history(task_id, 0)
+                    last, wait = standing_wait(events)
+                    if last is None or wait is None or (wait["issues"] and self._specialist_scope_active()):
+                        continue
+                    with self._priority("optional"):
+                        self._settle_wait(adapter, task, events, last, wait, issue_id=None,
+                                          scope=f"unbound:{adapter.board or 'default'}:{task_id}:{last.id}",
+                                          fields={"task": task_id, "evt": last.id}, authorize=lambda: True)
+                except (Throttled, RateLimited):
+                    raise
+                except Exception as exc:  # noqa: BLE001 - one task's history cannot hold the others
+                    diag.warn("external_wait.resume", "held", diag.exc_reason(exc), kind="unbound_scan",
+                              task=task_id, exc=type(exc).__name__)
     def _settle_held_delegate(self, row: dict | None, adapter) -> None:
         """Settle a held delegate write once a fresh readback shows the delegate it intended.
 
@@ -5508,6 +5579,7 @@ class Bridge:
                 self.drain_ingress(ingress)
             self._recover_stops()
             self.pump_kanban()
+            self.pump_unbound_waits()
             self.recheck()
         except Throttled:
             # Budget nearly spent: reads wait for the reset, but queued writes still go out.

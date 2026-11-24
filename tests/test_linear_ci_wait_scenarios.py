@@ -413,5 +413,143 @@ class CiWaitScenarios(unittest.TestCase):
         self.assert_resumed_once_with("passed")
 
 
+
+@unittest.skipIf(CORE is not None, f"native upstream source unavailable ({CORE})")
+class UnboundCiWaitScenarios(unittest.TestCase):
+    """HF-827: a follow-up task the agent created itself, with no Linear issue bound, parks on CI
+    and still resumes once with the verdict, through the bridge's ordinary tick."""
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory(prefix="linear-ci-unbound-")
+        self.addCleanup(temp.cleanup)
+        self.home = Path(temp.name)
+        environment = {key: value for key, value in os.environ.items() if not key.startswith("HERMES_KANBAN_") and key != "HERMES_DELEGATED_CHILD_CONTEXT"}
+        environment.update(HERMES_HOME=str(self.home), HERMES_KANBAN_HOME=str(self.home / "board"), HERMES_PROFILE="default")
+        env = patch.dict(os.environ, environment, clear=True)
+        env.start()
+        self.addCleanup(env.stop)
+        self.github = FakeGitHub()
+        gh = patch.object(acceptance, "gh_api", self.github)
+        gh.start()
+        self.addCleanup(gh.stop)
+        self.board = Kanban(profile="default", profile_home=self.home)
+        self.clock = Clock()
+        self.remote = FakeLinear(self.clock)
+        self.addCleanup(self.remote.close)
+        self.remote.add_issue(ISSUE, "HF-800", project=None)
+        self.reporter = Bridge(Store(self.home / "linear.db"), LinearAPI(lambda: "synthetic", endpoint=self.remote.url, clock=self.clock),
+                               self.board, profile="default", clock=self.clock)
+        # A bound task beside it, so the binding pump has work and must not claim the unbound one.
+        with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=self.clock()):
+            self.bound_id = kb.create_task(conn, title="Tracked work", assignee="default", initial_status="blocked")
+            self.task_id = kb.create_task(conn, title="Follow-up the agent filed itself", assignee="default")
+        self.reporter.track(ISSUE, self.bound_id)
+        self.reporter.tick()
+
+    def advance(self, seconds):
+        self.clock.now += seconds
+
+    def task(self):
+        return self.board.get(self.task_id)
+
+    def events(self):
+        return self.board.history(self.task_id, 0)
+
+    def verdicts(self):
+        with self.board.read_conn() as conn:
+            return [c.body for c in self.board.comments(conn, self.task_id) if c.body.startswith("CI verdict:")]
+
+    def park(self, reason=f"Pushed the fix; waiting for CI.\nCI gate: {PR_URL} within 90m"):
+        self.advance(1)
+        with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=self.clock()):
+            self.assertIsNotNone(kb.claim_task(conn, self.task_id))
+        self.advance(1)
+        run_id = self.board.get(self.task_id).current_run_id
+        with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=self.clock()):
+            self.assertTrue(kb.block_task(conn, self.task_id, reason=reason, kind="dependency", expected_run_id=run_id))
+        with self.board.conn() as conn, kb.write_txn(conn):
+            kb._append_event(conn, self.task_id, "worker_result",
+                             {"pid": 4242, "claim_lock": "host:1", "exit_code": 130, "last_output": ""}, run_id=run_id)
+        self.assertNotEqual(self.reporter.store.get(ISSUE)["task_id"], self.task_id)  # no issue is bound to it
+        self.reporter.tick()
+
+    def tick_after_gap(self, gap=GAP):
+        self.advance(gap)
+        self.reporter.tick()
+
+    def status(self):
+        from hermes_fleet_linear_plugin import ops
+        names = lambda: [meta["slug"] for meta in kb.list_boards(include_archived=False)]  # noqa: E731
+        items = ops.stuck(self.home / "linear.db", self.home / "absent", "default", now=self.clock(),
+                          boards=ops.native_boards, board_names=names)
+        return [item for item in items if item["ref"].endswith(self.task_id)]
+
+    def test_unbound_park_resumes_once_with_the_verdict(self):
+        bodies = len(self.remote.bodies(ISSUE))
+        self.park()
+        self.github.run(1, "CI", status="in_progress", conclusion=None)
+        self.tick_after_gap()
+        self.assertEqual(self.task().status, "blocked")
+        self.assertIsNone(self.task().current_run_id)  # parked: no worker, no slot
+        self.assertEqual(self.verdicts(), [])
+        [item] = self.status()
+        self.assertFalse(item["act"])
+        self.assertIn("parked on CI (no Linear issue)", item["why"])
+        self.github.run(1, "CI")
+        self.tick_after_gap()
+        self.assertEqual(self.task().status, "ready")
+        [verdict] = self.verdicts()
+        self.assertTrue(verdict.startswith("CI verdict: passed"), verdict)
+        self.assertIn(f"{REPO} PR #7 at {HEAD}: passed", verdict)
+        self.assertEqual(self.events()[-1].kind, "unblocked")
+        self.assertEqual(self.status(), [])
+        resumed = self.events()[-1].id
+        self.tick_after_gap()  # decided once
+        self.assertEqual(self.events()[-1].id, resumed)
+        self.assertEqual(self.board.get(self.bound_id).status, "blocked")  # the bound task is untouched
+        self.assertEqual(len(self.remote.bodies(ISSUE)), bodies)  # no issue: nothing is written to Linear
+
+    def test_unbound_park_times_out_and_resumes(self):
+        self.park(f"CI gate: {PR_URL} within 10m")
+        self.github.run(1, "CI", status="queued", conclusion=None)
+        self.tick_after_gap()
+        self.assertEqual(self.task().status, "blocked")
+        self.tick_after_gap(600)
+        self.assertEqual(self.task().status, "ready")
+        [verdict] = self.verdicts()
+        self.assertTrue(verdict.startswith("CI verdict: timed out"), verdict)
+
+    def test_stop_on_an_unbound_park_wins(self):
+        self.park()
+        self.advance(1)
+        self.assertTrue(self.board.stop(self.task_id, "linear:Stop requested"))
+        self.github.run(1, "CI")
+        self.tick_after_gap()
+        self.tick_after_gap()
+        self.assertEqual(self.task().status, "blocked")
+        self.assertEqual(self.verdicts(), [])
+
+    def test_another_profiles_task_is_left_alone(self):
+        with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=self.clock()):
+            other = kb.create_task(conn, title="Someone else's", assignee="reviewer")
+            kb.claim_task(conn, other)
+            run_id = conn.execute("SELECT current_run_id FROM tasks WHERE id=?", (other,)).fetchone()[0]
+            self.assertTrue(kb.block_task(conn, other, reason=f"CI gate: {PR_URL}", kind="dependency", expected_run_id=run_id))
+        self.github.run(1, "CI")
+        self.tick_after_gap()
+        self.tick_after_gap()
+        with self.board.read_conn() as conn:
+            status = conn.execute("SELECT status FROM tasks WHERE id=?", (other,)).fetchone()[0]
+        self.assertEqual(status, "blocked")
+
+    def test_a_stuck_unbound_park_is_an_operator_item(self):
+        self.park(f"CI gate: {PR_URL} within 10m")
+        self.advance(10 * 60 + 15 * 60 + 5)  # the gateway did not tick meanwhile
+        [item] = self.status()
+        self.assertTrue(item["act"])
+        self.assertEqual(item["issue"], "-")
+        self.assertIn("the gateway did not resume it", item["why"])
+
+
 if __name__ == "__main__":
     unittest.main()

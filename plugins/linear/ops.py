@@ -57,13 +57,68 @@ def native_boards(board: str) -> Path | None:
     except Exception:  # noqa: BLE001 - a status view without core still lists the outbox
         return None
 
-def _parks(db: sqlite3.Connection, boards: Callable[[str], Path | None], now: float, add) -> None:
-    """Bound tasks parked on CI or a dependency: in progress inside the window, an operator item past it.
+def native_board_names() -> list[str]:
+    """Every unarchived board in this native home, or none where core is not importable."""
+    try:
+        from hermes_cli import kanban_db
+        return [str(meta["slug"]) for meta in kanban_db.list_boards(include_archived=False)]
+    except Exception:  # noqa: BLE001 - a status view without core still lists the outbox
+        return []
+
+def native_board_of(path: Path) -> str | None:
+    """The board whose own database ``path`` is, by core's layout, or None.
+
+    A Kanban worker shell pins HERMES_KANBAN_DB, so core resolves every board name to that one
+    file (the fence that keeps workers on their own board). Status reads it once and labels it
+    with the board it belongs to, not with each name that resolved to it."""
+    try:
+        from hermes_cli import kanban_db
+        path = Path(path).resolve()
+        if path == (kanban_db.kanban_home() / "kanban.db").resolve():
+            return "default"
+        if path.name == "kanban.db" and path.parent.parent == kanban_db.boards_root().resolve():
+            return path.parent.name
+    except Exception:  # noqa: BLE001 - the first name that resolved to it labels it instead
+        pass
+    return None
+
+def _park(native: sqlite3.Connection, task_id: str, now: float) -> tuple[float, str, bool] | None:
+    """(parked at, why, stuck) for a task whose standing block is a wait the gateway resumes, else None."""
+    task = _rows(native, "SELECT status FROM tasks WHERE id = ?", task_id)
+    if not task or task[0]["status"] not in ("blocked", "triage"):
+        return None
+    last = _rows(native, "SELECT kind, payload, created_at FROM task_events WHERE task_id = ? AND kind IN "
+                 f"({','.join('?' * len(PARK_LIFECYCLE))}) ORDER BY id DESC LIMIT 1", task_id, *PARK_LIFECYCLE)
+    if not last or last[0]["kind"] not in ("blocked", "block_loop_detected"):
+        return None
+    try:
+        payload = json.loads(last[0]["payload"] or "{}")
+    except (TypeError, ValueError):
+        return None
+    wait = waits.parse(payload) if isinstance(payload, dict) else None
+    if not wait:
+        return None
+    window = max(gate["window"] for gate in wait["ci"]) if wait["ci"] else waits.CI_MAX_WINDOW
+    since, what = float(last[0]["created_at"]), "CI" if wait["ci"] else "a dependency"
+    if now - since > window + PARK_GRACE:
+        return since, (f"parked on {what} and still blocked {int((now - since - window) // 60)} min "
+                       "past its window; the gateway did not resume it"), True
+    return since, f"parked on {what}", False
+
+def _parks(db: sqlite3.Connection, boards: Callable[[str], Path | None], now: float, add,
+           board_names: Callable[[], list[str]] | None = None, profile: str | None = None,
+           board_of: Callable[[Path], str | None] | None = None) -> None:
+    """Tasks parked on CI or a dependency: in progress inside the window, an operator item past it.
 
     The gateway rechecks a CI park every two minutes and resumes it once CI on its head finishes or
     its window passes, so a CI park still blocked PARK_GRACE past its window is stuck. A dependency
-    park with no CI gate has no window of its own; it counts as stuck past waits.CI_MAX_WINDOW."""
+    park with no CI gate has no window of its own; it counts as stuck past waits.CI_MAX_WINDOW.
+    Bound tasks are listed under their issue. With ``board_names``, every other blocked or triaged
+    task assigned to ``profile`` on those boards is checked too (HF-827): this gateway resumes
+    exactly those, and one it did not resume is listed with no issue. Each database is read once,
+    however many board names resolve to it (a pinned HERMES_KANBAN_DB), under its own board."""
     bound: dict[str, list[tuple[str, str]]] = {}
+    bound_ids: set[str] = {row["task_id"] for row in _rows(db, "SELECT task_id FROM work") if row["task_id"]}
     for row in _rows(db, "SELECT m.value, w.task_id FROM metadata m JOIN work w ON m.key = 'native-binding:' || w.issue_id "
                          "WHERE m.key LIKE 'native-binding:%' AND w.origin = 'native'"):
         try:
@@ -72,45 +127,47 @@ def _parks(db: sqlite3.Connection, boards: Callable[[str], Path | None], now: fl
             continue
         if isinstance(binding, dict) and binding.get("task_id") == row["task_id"]:
             bound.setdefault(str(binding.get("board") or "default"), []).append((binding.get("issue_id") or "", row["task_id"]))
-    for board, tasks in sorted(bound.items()):
+    unbound = sorted(set(board_names()) if board_names is not None and profile else ())
+    databases: dict[Path, dict[str, Any]] = {}
+    for board in sorted(set(bound) | set(unbound)):
         path = boards(board)
         if path is None or not path.is_file():
             continue
-        with closing(_read(path)) as native:
+        seen = databases.setdefault(path.resolve(), {"path": path, "names": [], "bound": [], "scan": False})
+        seen["names"].append(board)
+        seen["bound"] += bound.get(board, ())
+        seen["scan"] = seen["scan"] or board in unbound
+    for found_at, seen in databases.items():
+        label = (board_of or native_board_of)(found_at) or seen["names"][0]
+        with closing(_read(seen["path"])) as native:
+            tasks = list(dict.fromkeys(seen["bound"]))
+            if seen["scan"]:
+                tasks += [("", row["id"]) for row in _rows(native, "SELECT id FROM tasks WHERE status IN ('blocked', 'triage') "
+                                                                    "AND assignee = ? ORDER BY id", profile)
+                          if row["id"] not in bound_ids]
             for issue, task_id in tasks:
-                task = _rows(native, "SELECT status FROM tasks WHERE id = ?", task_id)
-                if not task or task[0]["status"] not in ("blocked", "triage"):
+                found = _park(native, task_id, now)
+                if found is None:
                     continue
-                last = _rows(native, "SELECT kind, payload, created_at FROM task_events WHERE task_id = ? AND kind IN "
-                             f"({','.join('?' * len(PARK_LIFECYCLE))}) ORDER BY id DESC LIMIT 1", task_id, *PARK_LIFECYCLE)
-                if not last or last[0]["kind"] not in ("blocked", "block_loop_detected"):
-                    continue
-                try:
-                    payload = json.loads(last[0]["payload"] or "{}")
-                except (TypeError, ValueError):
-                    continue
-                wait = waits.parse(payload) if isinstance(payload, dict) else None
-                if not wait:
-                    continue
-                window = max(gate["window"] for gate in wait["ci"]) if wait["ci"] else waits.CI_MAX_WINDOW
-                since, what = float(last[0]["created_at"]), "CI" if wait["ci"] else "a dependency"
-                if now - since > window + PARK_GRACE:
-                    add(issue, task_id, since, f"parked on {what} and still blocked {int((now - since - window) // 60)} min "
-                        "past its window; the gateway did not resume it", STUCK_PARK, True)
-                else:
-                    add(issue, task_id, since, f"parked on {what}", "Resumes by itself when that is done.")
+                since, why, late = found
+                ref = task_id if issue else f"{label}:{task_id}"
+                if not issue:
+                    why += " (no Linear issue)"
+                add(issue, ref, since, why, STUCK_PARK if late else "Resumes by itself when that is done.", late)
 
 def stuck(state: Path, ingress: Path, profile: str, now: float | None = None, *,
-          boards: Callable[[str], Path | None] | None = None) -> list[dict[str, Any]]:
+          boards: Callable[[str], Path | None] | None = None,
+          board_names: Callable[[], list[str]] | None = None) -> list[dict[str, Any]]:
     """Every item holding an issue or a delivery, oldest first. `act` marks the ones only an operator can clear."""
-    return _scan(state, ingress, profile, now, boards=boards)[0]
+    return _scan(state, ingress, profile, now, boards=boards, board_names=board_names)[0]
 
 def aged_out(state: Path, ingress: Path, profile: str, now: float | None = None) -> int:
     """Undelivered writes past AGE_LIMIT that stuck() no longer lists; counted so they stay visible."""
     return _scan(state, ingress, profile, now)[1]
 
 def _scan(state: Path, ingress: Path, profile: str, now: float | None = None, *,
-          boards: Callable[[str], Path | None] | None = None) -> tuple[list[dict[str, Any]], int]:
+          boards: Callable[[str], Path | None] | None = None,
+          board_names: Callable[[], list[str]] | None = None) -> tuple[list[dict[str, Any]], int]:
     now, items, dismissed, aged = time.time() if now is None else now, [], set(), 0
     def add(issue: str, ref: str, since: float, why: str, action: str, act: bool = False) -> None:
         items.append({"issue": issue or "-", "ref": ref, "age_s": max(0, int(now - since)), "why": why,
@@ -177,7 +234,7 @@ def _scan(state: Path, ingress: Path, profile: str, now: float | None = None, *,
                     f"native {request.get('kind') or 'delivery'} outcome needs reconciliation",
                     "Inspect native task/comment/run and external state. Reuse the original request; never blindly replay.", True)
             if boards is not None:
-                _parks(db, boards, now, add)
+                _parks(db, boards, now, add, board_names, profile)
     if ingress.is_file():
         with closing(_read(ingress)) as db:
             for row in _rows(db, "SELECT logical_agent, delivery_id, payload, received_at, status, attempts FROM deliveries WHERE "
@@ -285,7 +342,7 @@ def run(args: Any, state: Path, ingress: Path, profile: str, *, origin_settings:
         print(json.dumps({"ok": True, **result}))
         return 0
     if args.linear_command == "status":
-        items, aged = _scan(state, ingress, profile, boards=native_boards)
+        items, aged = _scan(state, ingress, profile, boards=native_boards, board_names=native_board_names)
         print(json.dumps(items, indent=2) if args.json else report(items, show_all=getattr(args, "all", False), aged=aged))
         return 1 if any(item["act"] for item in items) else 0
     if args.linear_command == "resolve":
