@@ -242,6 +242,25 @@ How to work this task:
    due later, finish or hand off this stage and schedule the follow-up check with cronjob.
 """
 ASSESSMENT_NOTE = "4. This is a specialist assessment. kanban_complete metadata.issue_comment must be the human issue comment: Linear markdown, 40 to 12000 characters, with a newline, and no Project status update heading. The bridge posts that text on the issue. Do not call the linear tool. A completion without that field is unfinished.\n"
+WORKTREE_NOTE = ("Workspace: this task runs in its own git worktree and branch of the {project} project's canonical "
+                 "repo, cut from that clone's current HEAD. Before editing, move the fresh branch to the remote default "
+                 "branch (git fetch origin, then git reset --hard origin/main or the repo's default branch, while it "
+                 "holds no commits of yours). Push the branch for any PR and leave the tree clean: a clean, pushed "
+                 "worktree is removed when the task finishes.\n")
+
+
+def workspace_project_map(value: Any) -> dict[str, str]:
+    """``workspace_projects``: Linear label name -> Hermes project slug, matched case-insensitively.
+
+    An invalid map is ignored with a warning (every task then stays in scratch); it never stops the plugin."""
+    if not value:
+        return {}
+    if not isinstance(value, dict) or any(not isinstance(key, str) or not key.strip() or not isinstance(slug, str)
+                                          or not slug.strip() for key, slug in value.items()):
+        log.warning("linear: workspace_projects must map label names to Hermes project slugs; ignored")
+        return {}
+    return {key.strip().casefold(): slug.strip() for key, slug in value.items()}
+
 
 ISSUE_MARKER = re.compile(r"Linear issue ([^\s:]+): (https?://\S+)")
 ISSUE_URL_PATH = re.compile(r"(?P<prefix>(?:/[^/]+)*)/issue/(?P<ident>[^/]+)(?:/[^/]*)?/?")
@@ -1547,6 +1566,7 @@ class Bridge:
                        "blocked": "Blocked", **(settings.get("states") or {})}
         self.team_states = settings.get("team_states") or {}
         self.contracts = settings.get("completion_contracts") or {}
+        self.workspace_projects = workspace_project_map(settings.get("workspace_projects"))
         self.quiet = float(settings.get("quiet_minutes", 30)) * 60
         self.recheck_every = float(settings.get("recheck_minutes", 5)) * 60
         if self.recheck_every > 600:  # the keepalive must beat Linear's 30 min stale mark
@@ -2239,10 +2259,13 @@ class Bridge:
         if (getattr(self.api, "specialist_scope", None) or {}).get("requester_basis") == "agent_session":
             context = "\n\n".join((context, ASSESSMENT_NOTE)).strip()
         project = (fresh.get("project") or {}).get("id")
+        workspace = self._workspace_project(issue_id)
         payload = {"kind": "create", "issue_id": issue_id, "profile": self.kanban.executor_profile,
                    "board": self.kanban.board or "default", "external_key": key,
                    "title": f"{fresh.get('identifier') or issue_id}: {fresh.get('title') or 'Linear issue'}",
-                   "body": TASK_BODY.format(ident=fresh.get("identifier") or issue_id, url=fresh.get("url") or "", context=context),
+                   "body": TASK_BODY.format(ident=fresh.get("identifier") or issue_id, url=fresh.get("url") or "", context=context)
+                           + (WORKTREE_NOTE.format(project=workspace) if workspace else ""),
+                   **({"workspace_project": workspace} if workspace else {}),
                    "created_by": "linear", "completion_contract": self.contracts.get(project) or "local-only",
                    "source_ms": stamp, "parked": True, **({"requires_native_input": True} if staged else {})}
         intent_key = f"create:{issue_id}"
@@ -2268,7 +2291,7 @@ class Bridge:
                 # until it is bound.
                 task = self.kanban.create(title=payload["title"], created_by=payload["created_by"],
                     body=payload["body"], idempotency_key=key, completion_contract=payload["completion_contract"],
-                    **({"initial_status": "blocked"} if payload.get("parked") else {}))
+                    **self._workspace_fields(payload), **({"initial_status": "blocked"} if payload.get("parked") else {}))
             except BaseException:
                 # The request might have committed. Preserve intent; never call create again.
                 raise
@@ -2564,7 +2587,7 @@ class Bridge:
 
     def entrust(self, issue_id: str, *, route: dict | None = None, record_done: dict | None = None,
                 route_delegate: Callable[[dict, str], str] | None = None, takeover_from: str | None = None,
-                note: str = "", proven_ms: float | None = None) -> dict:
+                note: str = "", proven_ms: float | None = None, workspace: str | None = None) -> dict:
         """Chat-requested work under the same ownership rule a Linear assignment uses.
 
         The chat request is the authority, as a delegation is for _start. One native task per
@@ -2580,7 +2603,9 @@ class Bridge:
         "routing". takeover_from, note and proven_ms are for take_over: the delegate whose work a
         verified handover ended, a line for the new task saying where to continue from, and when
         that handover was requested. A takeover task is only created with that proof, and a
-        person's routing change or a Stop since the request refuses it.
+        person's routing change or a Stop since the request refuses it. workspace names the Hermes
+        project (one of ``workspace_projects``) whose repo a new task works in; without it the
+        issue's labels decide. Existing work keeps its own workspace.
         """
         with self.lock(issue_id):
             issue, row = self.entrust_checks(issue_id, takeover_from=takeover_from)
@@ -2593,7 +2618,7 @@ class Bridge:
                 if existing:
                     return self._entrust_existing(issue, existing, route, record_done, route_delegate)
             return self._entrust_create(issue, route, record_done, route_delegate, note=note, takeover_from=takeover_from,
-                                        proven_ms=proven_ms)
+                                        proven_ms=proven_ms, workspace=workspace)
 
     def entrust_checks(self, issue_id: str, *, takeover_from: str | None = None,
                        allow_closed: bool = False) -> tuple[dict, dict | None]:
@@ -2706,6 +2731,31 @@ class Bridge:
                     "this agent's work on it has already finished" if status in ("done", "archived") else
                     "this agent already has work linked to it")
 
+    def _workspace_project(self, issue_id: str) -> str | None:
+        """The Hermes project for an issue whose labels name exactly one mapped project, else None (scratch).
+
+        Native task creation anchors a project task to its own worktree and branch under the project's
+        canonical repo; an unknown project slug falls back to scratch there."""
+        if not self.workspace_projects:
+            return None
+        found = {self.workspace_projects[name.strip().casefold()] for name in self.api.issue_labels(issue_id)
+                 if name.strip().casefold() in self.workspace_projects}
+        return found.pop() if len(found) == 1 else None
+
+    def workspace_choice(self, workspace: str | None) -> str | None:
+        """A chat-named project for new work: one of the configured ``workspace_projects`` slugs, or LinearError."""
+        if workspace is None:
+            return None
+        allowed = sorted(set(self.workspace_projects.values()))
+        if not isinstance(workspace, str) or workspace.strip() not in allowed:
+            raise LinearError("repo must be one of this agent's coding projects: " + (", ".join(allowed) or "none configured")
+                              + ". Omit it for work that is not code in one of those repos.", retryable=False)
+        return workspace.strip()
+
+    def _workspace_fields(self, payload: dict) -> dict:
+        project = payload.get("workspace_project")
+        return {"project_id": project} if project else {}
+
     def _existing_task(self, issue: dict, existing: list):
         """The one native task already pointing at this issue that entrust may link, or LinearError."""
         if len(existing) != 1:
@@ -2745,16 +2795,21 @@ class Bridge:
         return self._entrust_bound(self.store.get(issue["id"]), route, None, route_delegate, issue)
 
     def _entrust_create(self, issue: dict, route: dict | None, record_done: dict | None, route_delegate=None,
-                        note: str = "", takeover_from: str | None = None, proven_ms: float | None = None) -> dict:
+                        note: str = "", takeover_from: str | None = None, proven_ms: float | None = None,
+                        workspace: str | None = None) -> dict:
         issue_id, key = issue["id"], f"linear:{issue['id']}"
         if takeover_from and proven_ms is None:
             raise LinearError("A takeover task is only created right after the other agent confirmed its pause", retryable=False)
         project = (issue.get("project") or {}).get("id")
+        # Work already finished in chat never runs, so it gets no worktree.
+        workspace = None if record_done else (self.workspace_choice(workspace) or self._workspace_project(issue_id))
         payload = {"kind": "create", "issue_id": issue_id, "profile": self.kanban.executor_profile,
                    "board": self.kanban.board or "default", "external_key": key,
                    "title": f"{issue.get('identifier') or issue_id}: {issue.get('title') or 'Linear issue'}",
                    "body": TASK_BODY.format(ident=issue.get("identifier") or issue_id, url=issue.get("url") or "",
-                                            context="\n\n".join(part for part in (note, issue.get("description") or "") if part)),
+                                            context="\n\n".join(part for part in (note, issue.get("description") or "") if part))
+                           + (WORKTREE_NOTE.format(project=workspace) if workspace else ""),
+                   **({"workspace_project": workspace} if workspace else {}),
                    "created_by": "linear", "completion_contract": self.contracts.get(project) or "local-only",
                    # The request is the authority: for take_over, its proof (a person's change since then wins).
                    "source_ms": float(proven_ms) if takeover_from else self.clock() * 1000,
@@ -2787,7 +2842,7 @@ class Bridge:
             # Created parked: released once bound (never, for work already finished in chat).
             try:
                 task = self.kanban.create(title=payload["title"], created_by=payload["created_by"], body=payload["body"],
-                    idempotency_key=key, completion_contract=payload["completion_contract"],
+                    idempotency_key=key, completion_contract=payload["completion_contract"], **self._workspace_fields(payload),
                     **({"initial_status": "blocked"} if payload.get("parked") or payload["record_done"] else {}))
             except Exception:
                 # A lost reply: the key finds what it committed. Nothing found stays uncertain (the

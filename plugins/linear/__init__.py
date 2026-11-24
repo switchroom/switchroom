@@ -21,7 +21,7 @@ from . import diag
 log = logging.getLogger(diag.LOGGER_NAME)
 SETTINGS = ("identity", "credentials", "states", "team_states", "completion_contracts", "quiet_minutes", "recheck_minutes",
             "api_url", "board", "ingress_database", "ingress_profile", "state_database", "tick_seconds", "activation_cutoff_ms",
-            "specialist_scope", "takeover")
+            "specialist_scope", "takeover", "workspace_projects")
 IDENTITY_TTL = 600.0  # seconds a verified credential->actor/workspace binding is reused for reads
 HISTORY_CURSOR_TTL = 600.0
 def rate_limit_path(state_database: Any, home: Path) -> Path:
@@ -424,6 +424,11 @@ class BoundLinearAPI(LinearAPI):
             parent_id = self.issue(parent_id)["id"]
         return super().create_issue(client_id, team["id"], title, description=description,
                                     project_id=project_id, parent_id=parent_id)
+
+    def issue_labels(self, issue_id):
+        # Read only, for an issue this app was just handed and has already read in scope.
+        with self._permit_specialist_operation():
+            return super().issue_labels(issue_id)
 
     def team_projects(self, team_id):
         if self.specialist_scope is not None:
