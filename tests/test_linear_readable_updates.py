@@ -123,6 +123,14 @@ class DoneBodyTests(unittest.TestCase):
         self.assertIn(other, body)
         self.assertEqual(body.count(self.PR), 1)
 
+    def test_pr_with_its_own_state_line_is_not_also_evidence(self):
+        # HF-833 (HF-832): the closing note said "Evidence: <PR>" and then "Pull request: <PR> (merged)".
+        other = "https://deploy.example/check/9"
+        self.assertEqual(_done_body("Fixed the export.", [self.PR], pr_lines=True), "Done. Fixed the export.")
+        self.assertEqual(_done_body("Fixed the export.", [self.PR, other], pr_lines=True),
+                         f"Done. Fixed the export.\n\nEvidence: {other}")
+        self.assertEqual(_done_body("", [self.PR], pr_lines=True), "Done.")
+
     def test_link_already_in_a_plain_summary_is_not_repeated(self):
         body = _done_body(f"Merged {self.PR} after review.", [self.PR])
         self.assertEqual(body, f"Done. Merged {self.PR} after review.")
