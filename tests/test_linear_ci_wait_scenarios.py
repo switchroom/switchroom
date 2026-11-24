@@ -150,16 +150,30 @@ class CiWaitScenarios(unittest.TestCase):
         with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=self.clock()):
             self.assertIsNotNone(kb.claim_task(conn, self.task_id))
 
-    def park(self, reason=f"Pushed the fix; waiting for CI.\nCI gate: {PR_URL}"):
-        """The worker's own kanban_block: its run ends and the card parks on CI."""
+    def park(self, reason=f"Pushed the fix; waiting for CI.\nCI gate: {PR_URL}", trail=("worker_result",)):
+        """The worker's own kanban_block: its run ends and the card parks on CI.
+
+        As in production, the worker's interpreter then exits and core records that run's
+        ``worker_result`` after the park (``gateway.session_kanban._record_worker_result``)."""
         self.claim()
         self.advance(1)
         run_id = self.board.get(self.task_id).current_run_id
         with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=self.clock()):
             self.assertTrue(kb.block_task(conn, self.task_id, reason=reason, kind="dependency", expected_run_id=run_id))
+        self.run_events(run_id, *trail)
         self.reporter.pump_kanban()
         self.advance(10)
         self.reporter.flush()
+
+    def run_events(self, run_id, *kinds):
+        """Events of one worker run, written the way core writes them."""
+        with self.board.conn() as conn, kb.write_txn(conn):
+            for kind in kinds:
+                payload = {"pid": 4242, "claim_lock": "host:1", "exit_code": 130, "last_output": ""} if kind == "worker_result" else None
+                kb._append_event(conn, self.task_id, kind, payload, run_id=run_id)
+
+    def park_event(self):
+        return [e for e in self.events() if e.kind in ("blocked", "block_loop_detected")][-1]
 
     def pump_after_gap(self, gap=GAP):
         self.advance(gap)
@@ -190,8 +204,12 @@ class CiWaitScenarios(unittest.TestCase):
         events = self.events()
         resume = events[-1]
         self.assertEqual(resume.kind, "unblocked")
-        self.assertEqual(events[-2].kind, "commented")  # the verdict lands before the resume
-        self.assertEqual(events[-3].kind, "blocked")  # the verdict was the only event since the park
+        park = self.park_event()
+        between = [e for e in events if park.id < e.id < resume.id]
+        news = [e for e in between if not (e.kind in ("worker_result", "heartbeat") and e.run_id == park.run_id)]
+        # The verdict was the only new event since the park, beside the parking run winding down.
+        self.assertEqual([e.kind for e in news], ["commented"])
+        self.assertIn("worker_result", [e.kind for e in between])
         self.pump_after_gap()  # decided once: nothing more happens
         self.assertEqual(self.events()[-1].id, resume.id)
         return verdicts[0]
@@ -261,7 +279,8 @@ class CiWaitScenarios(unittest.TestCase):
 
     def test_stop_while_parked_wins(self):
         self.park()
-        blocked = self.events()[-1]
+        blocked = self.park_event()
+        self.assertEqual(self.events()[-1].kind, "worker_result")  # the Stop lands after the run's result
         self.advance(1)
         self.assertTrue(self.board.stop(self.task_id, "linear:Stop requested"))
         self.github.run(1, "CI")
@@ -328,7 +347,8 @@ class CiWaitScenarios(unittest.TestCase):
         self.github.pr = {"state": "open", "merged": False, "head": {"sha": "c" * 40}}  # the fix is pushed
         self.park()
         self.assertEqual(self.task().status, "triage")  # core's block-loop breaker
-        self.assertEqual(self.events()[-1].kind, "block_loop_detected")
+        self.assertEqual(self.park_event().kind, "block_loop_detected")
+        self.assertEqual(self.events()[-1].kind, "worker_result")
         self.assertEqual(self.remote.state(ISSUE), "In Review")
         self.github.run(2, "CI", sha="c" * 40)
         self.pump_after_gap()
@@ -336,6 +356,51 @@ class CiWaitScenarios(unittest.TestCase):
         verdicts = self.verdicts()
         self.assertEqual(len(verdicts), 2)
         self.assertIn(f"at {'c' * 40}: passed", verdicts[-1])
+
+    def test_resumes_with_the_parking_runs_heartbeat_and_result_after_the_park(self):
+        # HF-822: core records the worker's late heartbeat and its exit after the block; neither is new.
+        self.park(trail=("heartbeat", "worker_result"))
+        self.assertEqual([e.kind for e in self.events()[-3:]], ["blocked", "heartbeat", "worker_result"])
+        self.github.run(1, "CI")
+        self.pump_after_gap()
+        self.assert_resumed_once_with("passed")
+
+    def test_a_comment_after_the_worker_result_still_holds_the_park(self):
+        self.park()
+        self.advance(1)
+        with self.board.conn() as conn:
+            kb.add_comment(conn, self.task_id, "operator", "Hold on, do not resume yet.")
+        self.github.run(1, "CI")
+        self.pump_after_gap()
+        self.pump_after_gap()
+        self.assert_parked()
+        self.assertEqual(self.events()[-1].kind, "commented")
+
+    def test_an_event_outside_the_parking_run_still_holds_the_park(self):
+        self.park()
+        self.run_events(None, "heartbeat")  # not the parking run's own wind-down
+        self.github.run(1, "CI")
+        self.pump_after_gap()
+        self.pump_after_gap()
+        self.assert_parked()
+
+    def test_a_late_worker_result_beside_the_verdict_still_resumes(self):
+        # The run's result lands after the verdict comment, before the guarded resume.
+        self.park(trail=())
+        park_run = self.park_event().run_id
+        self.github.run(1, "CI")
+        original = Kanban.comment
+
+        def comment_then_exit(adapter, task_id, body, **kwargs):
+            comment_id = original(adapter, task_id, body, **kwargs)
+            self.run_events(park_run, "worker_result")
+            return comment_id
+
+        with patch.object(Kanban, "comment", comment_then_exit):
+            self.pump_after_gap()
+        self.assertEqual(self.task().status, "ready")
+        self.assertEqual([e.kind for e in self.events()[-4:]], ["blocked", "commented", "worker_result", "unblocked"])
+        self.assertEqual(len(self.verdicts()), 1)
 
     def test_issue_and_ci_conditions_must_both_hold(self):
         self.remote.add_issue("issue-646", "LIFE-646", project=None)

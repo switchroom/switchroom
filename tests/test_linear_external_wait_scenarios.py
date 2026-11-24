@@ -98,9 +98,17 @@ class ExternalWaitScenarios(unittest.TestCase):
         self.clock.now += seconds
 
     def block(self, reason):
+        """The worker's own block from its run, then that run's ``worker_result`` as core records it (HF-822)."""
         self.advance(1)
         with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=self.clock()):
-            self.assertTrue(kb.block_task(conn, self.task_id, reason=reason, kind="dependency"))
+            self.assertIsNotNone(kb.claim_task(conn, self.task_id))
+        run_id = self.board.get(self.task_id).current_run_id
+        self.advance(1)
+        with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=self.clock()):
+            self.assertTrue(kb.block_task(conn, self.task_id, reason=reason, kind="dependency", expected_run_id=run_id))
+        with self.board.conn() as conn, kb.write_txn(conn):
+            kb._append_event(conn, self.task_id, "worker_result",
+                             {"pid": 4242, "claim_lock": "host:1", "exit_code": 130, "last_output": ""}, run_id=run_id)
         self.reporter.pump_kanban()
         self.advance(10)
         self.reporter.flush()
@@ -130,7 +138,8 @@ class ExternalWaitScenarios(unittest.TestCase):
         self.assertEqual(len(unblocked), 2)  # setup's resume, then this one (upstream's plain unblock)
         events = self.board.history(self.task_id, 0)
         self.assertEqual(events[-1].id, unblocked[-1].id)
-        self.assertEqual(events[-2].id, [e for e in events if e.kind == "blocked"][-1].id)  # the wait was newest
+        self.assertEqual(events[-2].kind, "worker_result")  # the parking run's exit, not a new event
+        self.assertEqual(events[-3].id, [e for e in events if e.kind == "blocked"][-1].id)  # the wait was newest
         self.reporter.flush()
         self.assertTrue(any("done. The agent continues" in body for body in self.remote.bodies(ISSUE)))
 
