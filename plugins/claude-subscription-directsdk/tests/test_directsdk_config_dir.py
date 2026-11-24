@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from conftest import PLUGIN_NAME
+from conftest import PLUGIN_NAME, popen_from_run
 from test_directsdk import FAKE
 from test_directsdk_setup import PINNED_PICKER, PRO
 
@@ -81,7 +81,7 @@ def test_unreadable_config_means_not_set(profile, tmp_path, monkeypatch):
     monkeypatch.setattr(hermes_cli.config, "load_config_readonly", unreadable)
     fallback = str(tmp_path / "fallback")
     assert directsdk_setup.apply_config_dir({OVERRIDE: fallback}) == {NATIVE_DIR: fallback}
-    assert directsdk_setup.telemetry_enabled() is True
+    assert directsdk_setup.telemetry_enabled() is False
 
 
 def test_a_multi_profile_gateway_reads_each_profiles_own_setting(profile, tmp_path):
@@ -152,6 +152,7 @@ def test_setup_probes_pass_the_profile_directory(profile, tmp_path, monkeypatch,
                 "models": PINNED_PICKER, "account": PRO["account"]}}}
         return SimpleNamespace(stdout=json.dumps(output), returncode=0)
     monkeypatch.setattr(directsdk_setup.subprocess, "run", run)
+    monkeypatch.setattr(directsdk_setup.subprocess, "Popen", popen_from_run(run))
     env = {"PATH": os.defpath, "HOME": str(tmp_path), OVERRIDE: str(tmp_path / "override")}
     result = getattr(directsdk_setup, probe)(command=[sys.executable], env=env)
     assert result["logged_in"] if probe == "setup_status" else result
@@ -170,3 +171,31 @@ def test_manifest_declares_the_setting_under_the_key_the_code_reads(profile):
     assert directsdk_setup.CONFIG_DIR_SETTING == SETTING
     assert field["type"] == "string" and field["default"] == ""
     assert field["label"] and field["description"]
+
+
+def test_manifest_declares_the_isolation_setting_under_the_key_the_code_reads(profile):
+    from hermes_cli.plugins_settings import plugin_settings_fields
+    import directsdk_setup
+    root = Path(directsdk_setup.__file__).resolve().parent
+    fields = {field["key"]: field for field in plugin_settings_fields(PLUGIN_NAME, root)}
+    field = fields[directsdk_setup.ISOLATE_LOGINS_SETTING]
+    assert field["type"] == "boolean" and field["default"] is False
+    assert field["label"] and field["description"]
+
+
+@pytest.mark.parametrize("source", ["setting", "override", "inherited"])
+@pytest.mark.parametrize("spelling", ["~/.claude", "~/.claude/", "{home}/.claude"])
+def test_the_cli_default_directory_is_never_exported(profile, tmp_path, monkeypatch, source, spelling):
+    """With CLAUDE_CONFIG_DIR set, Claude Code reads the macOS Keychain login under a name derived from the
+    directory, so pointing it at its own default ~/.claude reads as logged out (#409). The default stays
+    unexported; any other directory is exported as before."""
+    import directsdk_setup
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    value = spelling.format(home=tmp_path)
+    env = {"HOME": str(tmp_path), "USERPROFILE": str(tmp_path)}
+    if source == "setting":
+        _set_config_dir(value)
+    else:
+        env[OVERRIDE if source == "override" else NATIVE_DIR] = value
+    assert NATIVE_DIR not in directsdk_setup.apply_config_dir(env)

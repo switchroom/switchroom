@@ -241,6 +241,64 @@ def test_large_history_replay_and_eof(cli):
     assert client._create(**req).choices[0].message.content == 'offline-ok'
 
 
+def test_history_replay_starts_one_stdin_watchdog_not_a_thread_per_frame(cli, monkeypatch):
+    """Every replayed frame is one stdin write; its stall guard must not cost one thread start each."""
+    started = []
+    original = threading.Thread.start
+    def counted(self):
+        started.append(self)
+        return original(self)
+    monkeypatch.setattr(threading.Thread, 'start', counted)
+    req = query('first')
+    for n in range(60):
+        req['messages'] += [{'role': 'assistant', 'content': f'a{n}'}, {'role': 'user', 'content': f'u{n}'}]
+    assert client_frames(req) == 121
+    assert cli.make()._create(**req).choices[0].message.content == 'offline-ok'
+    watchdogs = [t for t in started if t.name == 'claude-directsdk-stdin-watch']
+    assert len(watchdogs) == 1 and not any(isinstance(t, threading.Timer) for t in started)
+    assert len(started) < 10, f'{len(started)} threads started for one request'
+    watchdogs[0].join(2)
+    assert not watchdogs[0].is_alive(), 'the stdin watchdog outlived its request'
+
+
+def client_frames(req):
+    return len(ds.prepare_history(req['messages'])[1])
+
+
+def test_stdin_watchdog_fires_at_the_deadline_of_the_write_in_flight():
+    """A write that begins while the watchdog sleeps is killed at its own deadline: not early, at the
+    watchdog's next wake-up (a healthy write would die), and not late."""
+    fired = []
+    watch = ds._StdinWatch(.4, lambda: fired.append(time.monotonic()))
+    try:
+        with watch:
+            pass  # A first, short write starts the thread: it now sleeps a full timeout.
+        time.sleep(.25)
+        with watch:
+            began = time.monotonic()
+            eventually(lambda: fired, timeout=2)
+        assert watch.stalled.is_set()
+        assert .38 <= fired[0] - began < .8, fired[0] - began
+    finally:
+        watch.stop()
+
+
+def test_stdin_watchdog_ignores_short_writes_however_long_they_run_together():
+    fired = []
+    watch = ds._StdinWatch(.15, lambda: fired.append(1))
+    try:
+        until = time.monotonic() + .6
+        while time.monotonic() < until:
+            with watch:
+                time.sleep(.01)
+        time.sleep(.2)
+        assert not fired and not watch.stalled.is_set()
+    finally:
+        watch.stop()
+    watch._thread.join(2)
+    assert not watch._thread.is_alive()
+
+
 @pytest.mark.skipif(os.name == 'nt' or not hasattr(os, 'waitid'), reason='POSIX WNOWAIT ownership contract')
 @pytest.mark.parametrize('completion', ['cancel'])
 def test_exited_owned_launcher_cleans_descendants_before_reap(cli, completion):
@@ -384,12 +442,15 @@ def test_exited_launcher_with_inherited_stdout_is_cleaned_on_timeout(cli):
                             'stdout=None,\n                     stderr=')
     script = cli.root / 'inherited_pipe.py'
     script.write_text(source)
-    client = cli.make('launcher_exit', timeout=.3)
+    # Long enough for two interpreter starts under load; the descendant sleeps 20 s, so a cleanup that waited for it
+    # still fails the bound below.
+    timeout = 2
+    client = cli.make('launcher_exit', timeout=timeout)
     client.command = [sys.executable, '-I', str(script)]
     began = time.monotonic()
     with pytest.raises(TimeoutError):
         client._create(**query())
-    assert time.monotonic() - began < 2, 'cleanup waited for a descendant holding stdout'
+    assert time.monotonic() - began < timeout + 2, 'cleanup waited for a descendant holding stdout'
     records = [json.loads(line) for line in (cli.root / 'pids.jsonl').read_text().splitlines()]
     assert len(records) == 2
     eventually(lambda: not any(living(row['pid']) for row in records))

@@ -1,7 +1,6 @@
 """Claude Subscription DirectSDK (Experimental) — standalone Hermes model-provider registration."""
 from datetime import datetime, timezone
 import logging
-import math
 import os
 import shutil
 
@@ -12,9 +11,17 @@ from providers.base import ProviderProfile
 try:
     from .model_catalog import ALIASES, MODEL_METADATA, MODEL_CAPABILITIES, PICKER_ROUTES, native_model
     from .directsdk_setup import INSTALL_HINT, _resolve
+    from .extra_usage import usage_percent as _percent
+    # Resolve once at module import: plugin re-discovery can evict this package from sys.modules,
+    # and a lazy relative import inside a method then fails as "No module named 'directsdk'".
+    from . import directsdk as _directsdk
+    from . import directsdk_setup as _directsdk_setup
 except ImportError:
     from model_catalog import ALIASES, MODEL_METADATA, MODEL_CAPABILITIES, PICKER_ROUTES, native_model
     from directsdk_setup import INSTALL_HINT, _resolve
+    from extra_usage import usage_percent as _percent
+    import directsdk as _directsdk
+    import directsdk_setup as _directsdk_setup
 
 logger = logging.getLogger(__name__)
 
@@ -32,12 +39,6 @@ LEGACY_WINDOWS = (('five_hour', 'Current session'), ('seven_day', 'Current week'
                   ('seven_day_opus', 'Opus week'), ('seven_day_sonnet', 'Sonnet week'))
 
 
-def _percent(value, fraction=False):
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
-        return None
-    return value * 100.0 if fraction and value <= 1 else float(value)
-
-
 def _reset_at(value):
     if not isinstance(value, str) or not value.strip():
         return None
@@ -48,34 +49,83 @@ def _reset_at(value):
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
+def _money(value):
+    """``{amount_minor, currency, exponent}`` -> ``"12.34 USD"``; anything else -> None."""
+    if not isinstance(value, dict):
+        return None
+    minor, exponent = value.get('amount_minor'), value.get('exponent', 2)
+    if _percent(minor) is None or isinstance(exponent, bool) or not isinstance(exponent, int) or not 0 <= exponent <= 6:
+        return None
+    return f"{minor / 10 ** exponent:.{exponent}f} {value.get('currency') or 'USD'}"
+
+
+def _usage_details(payload, windows):
+    """Extra usage, spend, per-surface and per-model lines; shown whatever shape the windows came in."""
+    from agent.account_usage import AccountUsageWindow
+    details = []
+    extra = payload.get('extra_usage') if isinstance(payload.get('extra_usage'), dict) else None
+    if extra is not None:
+        spent, cap = _percent(extra.get('used_credits')), _percent(extra.get('monthly_limit'))
+        currency = extra.get('currency') or 'USD'
+        if not extra.get('is_enabled'):
+            reason = extra.get('disabled_reason')
+            details.append('Extra usage: off' + (f' ({reason})' if isinstance(reason, str) and reason else ''))
+        elif spent is not None and cap is not None:
+            details.append(f'Extra usage: {spent:.2f} / {cap:.2f} {currency}')
+        else:
+            details.append('Extra usage: on' + (f', {spent:.2f} {currency} used' if spent is not None else ''))
+    spend = payload.get('spend') if isinstance(payload.get('spend'), dict) else {}
+    used, limit = _money(spend.get('used')), _money(spend.get('limit'))
+    if used:
+        details.append(f'Usage credits spent: {used}' + (f' of {limit}' if limit else ''))
+    breakdown = payload.get('seven_day_breakdown') if isinstance(payload.get('seven_day_breakdown'), dict) else {}
+    rows = breakdown.get('rows') if isinstance(breakdown.get('rows'), list) else []
+    rows = [row for row in rows if isinstance(row, dict)]
+    shares = [f"{row.get('display_name') or row.get('key')} {round(_percent(row.get('percent')))}%"
+              for row in rows if _percent(row.get('percent')) is not None]
+    if shares:
+        details.append('This week by surface: ' + ', '.join(shares))
+    # get_usage's model_scoped utilization is a 0-100 percent, like limits[].percent (Fable 0 / 0 on 2.1.319).
+    shown = {window.label for window in windows}
+    for row in payload.get('model_scoped') if isinstance(payload.get('model_scoped'), list) else ():
+        name = row.get('display_name') if isinstance(row, dict) else None
+        if isinstance(name, str) and name and f'{name} week' not in shown:
+            windows.append(AccountUsageWindow(label=f'{name} week', used_percent=_percent(row.get('utilization')),
+                                              reset_at=_reset_at(row.get('resets_at'))))
+    return details
+
+
 def usage_windows(payload):
     """Plan-limits body (Claude Code's `get_usage` `rate_limits`, the `/api/oauth/usage` shape) -> (windows, detail lines). Untrusted shapes degrade, never raise."""
     from agent.account_usage import AccountUsageWindow
     limits = payload.get('limits')
     limits = [entry for entry in limits if isinstance(entry, dict)] if isinstance(limits, list) else []
-    if limits:
-        windows = []
-        for entry in limits:
-            kind = entry.get('kind')
-            scope = entry.get('scope') if isinstance(entry.get('scope'), dict) else {}
-            model = scope.get('model') if isinstance(scope.get('model'), dict) else {}
-            name = model.get('display_name')
-            label = (LIMIT_LABELS.get(kind) if isinstance(kind, str) else None) or (
-                f'{name} week' if isinstance(name, str) and name else str(kind or 'unknown'))
-            windows.append(AccountUsageWindow(label=label, used_percent=_percent(entry.get('percent')),
-                                              reset_at=_reset_at(entry.get('resets_at'))))
-        return windows, []
     windows = []
-    for key, label in LEGACY_WINDOWS:
-        window = payload.get(key)
-        used = _percent(window.get('utilization'), fraction=True) if isinstance(window, dict) else None
-        if used is not None:
-            windows.append(AccountUsageWindow(label=label, used_percent=used, reset_at=_reset_at(window.get('resets_at'))))
-    extra = payload.get('extra_usage') if isinstance(payload.get('extra_usage'), dict) else {}
-    spent, cap = _percent(extra.get('used_credits')), _percent(extra.get('monthly_limit'))
-    details = [f"Extra usage: {spent:.2f} / {cap:.2f} {extra.get('currency') or 'USD'}"] if (
-        extra.get('is_enabled') and spent is not None and cap is not None) else []
-    return windows, details
+    for entry in limits:
+        kind = entry.get('kind')
+        scope = entry.get('scope') if isinstance(entry.get('scope'), dict) else {}
+        model = scope.get('model') if isinstance(scope.get('model'), dict) else {}
+        name = model.get('display_name')
+        label = (LIMIT_LABELS.get(kind) if isinstance(kind, str) else None) or (
+            f'{name} week' if isinstance(name, str) and name else str(kind or 'unknown'))
+        windows.append(AccountUsageWindow(label=label, used_percent=_percent(entry.get('percent')),
+                                          reset_at=_reset_at(entry.get('resets_at'))))
+    if not limits:
+        for key, label in LEGACY_WINDOWS:
+            window = payload.get(key)
+            used = _percent(window.get('utilization'), fraction=True) if isinstance(window, dict) else None
+            if used is not None:
+                windows.append(AccountUsageWindow(label=label, used_percent=used, reset_at=_reset_at(window.get('resets_at'))))
+    return windows, _usage_details(payload, windows)
+
+
+def _delegated_child(cache_scope_id):
+    """Whether core stamped this request's cache scope as one a parent's delegated children share (``sub_<hash>``)."""
+    try:
+        from agent.prompt_cache_scope import is_sibling_cache_scope
+    except ImportError:  # a core without the helper mints the same prefix
+        return isinstance(cache_scope_id, str) and cache_scope_id.startswith('sub_')
+    return is_sibling_cache_scope(cache_scope_id)
 
 
 class ClaudeOAuthDirectSDKProfile(ProviderProfile):
@@ -110,11 +160,7 @@ class ClaudeOAuthDirectSDKProfile(ProviderProfile):
                           label=format_cost_label(amount), notes=('native API list-price equivalent; not subscription invoice; extra usage unknown',))
 
     def create_client(self, **client_kwargs):
-        try:
-            from .directsdk import Client
-        except ImportError:
-            from directsdk import Client
-        return Client(**client_kwargs)
+        return _directsdk.Client(**client_kwargs)
 
     def fetch_models(self, **kwargs):
         # No HTTP /models endpoint: the account's own picker (CLI `initialize` handshake) is the
@@ -123,18 +169,10 @@ class ClaudeOAuthDirectSDKProfile(ProviderProfile):
         return [row["id"] for row in rows] if rows else None
 
     def setup_status(self, **kwargs):
-        try:
-            from .directsdk_setup import setup_status
-        except ImportError:
-            from directsdk_setup import setup_status
-        return setup_status(**kwargs)
+        return _directsdk_setup.setup_status(**kwargs)
 
     def discover_models(self, **kwargs):
-        try:
-            from .directsdk_setup import discover_models
-        except ImportError:
-            from directsdk_setup import discover_models
-        return discover_models(**kwargs)
+        return _directsdk_setup.discover_models(**kwargs)
 
     def build_api_kwargs_extras(self, *, reasoning_config=None, **context):
         extra = {'reasoning': dict(reasoning_config)} if reasoning_config else {}
@@ -142,21 +180,34 @@ class ClaudeOAuthDirectSDKProfile(ProviderProfile):
         # conversation context its chat path always passes (session_id). Mark them so the client can skip
         # a message cache write that no later request would read.
         auxiliary = context.get('task') is not None or 'session_id' not in context
-        return extra, ({'hermes_auxiliary': True} if auxiliary else {})
+        top = {'hermes_auxiliary': True} if auxiliary else {}
+        # A delegated child never uses the 1h cache tier in core (``_apply_child_cache_ttl``), but core can only
+        # clamp the markers it builds, and here native places them: a `claude -p` turn is Claude Code's main
+        # conversation, which asks for one hour on a subscription. Say 5m for the child's requests.
+        if _delegated_child(context.get('cache_scope_id')):
+            top['hermes_cache_ttl'] = '5m'
+        return extra, top
 
     def fetch_account_usage(self, *, base_url=None, api_key=None):
         """`/usage` plan limits, asked of Claude Code itself; every failure is an `Unavailable:` line, never a raise."""
         from agent.account_usage import AccountUsageSnapshot
-        try:
-            from .directsdk_setup import fetch_usage
-        except ImportError:
-            from directsdk_setup import fetch_usage
-
-        limits, reason = fetch_usage()
+        limits, reason = _directsdk_setup.fetch_usage()
         windows, details = usage_windows(limits) if limits is not None else ((), ())
         return AccountUsageSnapshot(provider=self.name, source='claude_code_get_usage', fetched_at=datetime.now(timezone.utc),
                                     title='Claude plan limits', windows=tuple(windows), details=tuple(details),
                                     unavailable_reason=reason)
+
+
+# The server's 400 when it bills a request to extra usage the account cannot draw (P#296; Team/Enterprise
+# "Ask your workspace admin", individual plans "Add more at claude.ai/settings/usage").
+THIRD_PARTY_EXTRA_USAGE = 'third-party apps now draw from'
+
+
+def _plan_limit(message):
+    # usage_window keeps core from switching providers on a plan limit and shows the message verbatim;
+    # no fallback: the next provider in the chain may be paid API usage.
+    return {'reason': 'billing', 'retryable': False, 'should_fallback': False,
+            'error_context': {'usage_window': True, 'display_message': message}}
 
 
 def classify_api_error(error, **_):
@@ -165,6 +216,21 @@ def classify_api_error(error, **_):
     # as this error; Hermes marks its request cancelled first, drops ours and raises InterruptedError.
     if isinstance(error, RuntimeError) and str(error) == 'Claude request cancelled':
         return {'reason': 'timeout'}
+    if type(error).__name__ == 'ClaudeUpstreamConfigError':
+        # The profile's gateway setting is wrong: no retry fixes it, and no provider switch should hide it.
+        return {'reason': 'format_error', 'retryable': False, 'should_fallback': False}
+    if type(error).__name__ == 'ClaudeExtraUsageBlocked':
+        return _plan_limit(str(error))
+    if type(error).__name__ == 'ClaudeAPIError' and THIRD_PARTY_EXTRA_USAGE in str(error).lower():
+        return _plan_limit(
+            'Claude refused this request and would bill it to extra usage ("Third-party apps now draw from your '
+            'extra usage"), which this account cannot draw now. Claude Code runs as `hermes-agent` for this '
+            'provider. Check the plan and extra-usage settings at https://claude.ai/settings/usage (on Team or '
+            f'Enterprise, your workspace admin controls them). Upstream said: {str(error)[:400]}')
+    # A request refused before Claude Code starts fails the same way on every retry; another provider may serve it.
+    # Matched by class name: the plugin can load as a package or as top-level modules, so the class may be either copy.
+    if type(error).__name__ == 'RequestRejected':
+        return {'reason': 'format_error', 'retryable': False, 'should_fallback': True}
     return None
 
 
@@ -194,6 +260,8 @@ profile = ClaudeOAuthDirectSDKProfile(
 # Attribute assignment keeps the plugin loadable on hosts predating this capability.
 # Newer hosts use it to avoid buffering a healthy native stream behind a stale-call timer.
 profile.supports_streaming = True
+# Schema-less json_object is refused (only json_schema maps to native structured output); Hermes drops it up front.
+profile.unsupported_response_formats = ('json_object',)
 register_provider(profile)
 
 # The provider stays registered when Claude Code is missing so `hermes model` can show the

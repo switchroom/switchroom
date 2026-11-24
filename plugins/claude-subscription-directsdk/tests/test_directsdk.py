@@ -68,12 +68,41 @@ def _wait_gone(*pids, timeout=15):
     # Reaping is event-driven; the bound only guards a hang and must tolerate a loaded runner.
     import psutil
 
+    def alive(pid):
+        try:
+            return psutil.pid_exists(pid) and psutil.Process(pid).status() != psutil.STATUS_ZOMBIE
+        except psutil.NoSuchProcess:
+            return False
+
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if not any(psutil.pid_exists(pid) and psutil.Process(pid).status() != psutil.STATUS_ZOMBIE for pid in pids):
+        if not any(alive(pid) for pid in pids):
             return True
         time.sleep(0.02)
     return False
+
+
+class WaitGoneContract(unittest.TestCase):
+    def test_pid_reaped_between_checks_counts_as_gone(self):
+        # On a loaded runner the PID can vanish between pid_exists() and Process().
+        from unittest.mock import patch
+
+        import psutil
+
+        def reaped(pid):
+            raise psutil.NoSuchProcess(pid)
+
+        with patch.object(psutil, "pid_exists", return_value=True), patch.object(psutil, "Process", side_effect=reaped):
+            self.assertTrue(_wait_gone(3160, timeout=1))
+
+    def test_live_process_still_counts_as_alive(self):
+        from unittest.mock import patch
+
+        import psutil
+
+        live = SimpleNamespace(status=lambda: "running")
+        with patch.object(psutil, "pid_exists", return_value=True), patch.object(psutil, "Process", return_value=live):
+            self.assertFalse(_wait_gone(3160, timeout=1))
 
 
 class Contract(unittest.TestCase):
@@ -216,6 +245,25 @@ class Contract(unittest.TestCase):
             req["messages"] += [msg, {"role": "tool", "tool_call_id": "toolu_test", "content": "ok"}]
             # The fake native asserts the replayed tool_use carries REPLAY_NAME.
             self.assertEqual(client.chat.completions.create(**req).choices[0].message.content, "done")
+            client.close()
+
+    def test_server_segment_slip_maps_to_the_tool_and_replays_with_the_offered_name(self):
+        # Native also drops only the server segment (`mcp__tool_call` for `mcp__hermes__tool_call`).
+        # The plugin restores it, so core sees the clean name and logs no auto-repair per call.
+        with tempfile.TemporaryDirectory() as tmp:
+            client = self.client(tmp, TOOL_NAME="mcp__probe", REPLAY_NAME="mcp__hermes__probe")
+            for streaming in (False, True):
+                req = self.request()
+                result = client.chat.completions.create(**req, stream=streaming)
+                if streaming:
+                    chunks = list(result)
+                    calls = [tc for c in chunks if c.choices for tc in (c.choices[0].delta.tool_calls or [])]
+                    details = [d for c in chunks if c.choices for d in (getattr(c.choices[0].delta, "reasoning_details", None) or [])]
+                else:
+                    calls, details = result.choices[0].message.tool_calls, result.choices[0].message.reasoning_details
+                self.assertEqual([c.function.name for c in calls], ["probe"])
+                carried = [b["name"] for m in details[0]["messages"] for b in m["content"] if b["type"] == "tool_use"]
+                self.assertEqual(carried, ["mcp__hermes__probe"])
             client.close()
 
     def test_logged_out_native_raises_the_login_hint(self):
@@ -388,7 +436,8 @@ class Contract(unittest.TestCase):
             hanging.close()
             unstarted = self.client(tmp)
             stream = unstarted.create(**self.request(), stream=True)
-            unstarted.close()
+            # Client.close() leaves requests alone (#378); an unstarted stream is finalized by its own close().
+            stream.close()
             self.assertEqual(len(unstarted._requests), 0)
 
 
