@@ -117,7 +117,7 @@ Sidecar source lives under `sidecars/`. Each sidecar publishes its own GHCR imag
 The published child, `ghcr.io/switchroom/switchroom`, is a digest-pinned child of an exact Hermes Agent image. It currently bundles:
 
 - UID/GID 1000 for the `hermes` account so profile containers can start with no-new-privileges
-- GitHub CLI 2.104.0 from the official release tarball
+- GitHub CLI 2.105.0 from the official release tarball
 - 1Password CLI 2.42.0 from its digest-pinned official image (no vault config)
 - Honcho Python SDK 2.9.0 in the Agent runtime and Honcho CLI 0.6.0 in an isolated environment, installed from hashed dependency locks with no workspace identifiers
 - Codex, Grok, OpenCode, and Claude Code from the committed lockfile

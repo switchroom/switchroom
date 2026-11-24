@@ -32,15 +32,15 @@ ONEPASSWORD_CLI_IMAGE = (
     "docker.io/1password/op@"
     "sha256:b0d7eebcb09bdc9d5862af91533e1851c968d4f969270c906f5da8c574f87e93"
 )
-CLAUDE_CODE_VERSION = "2.1.323"
-CLAUDE_CODE_INTEGRITY = "sha512-6YjP5aY9xKZfYsYOoUDZ/AKNbPCSOnjMvSI2vdfoBjBN5adCeQIZ3u/QkEFK21Z0PMdssQWOyw75a1IeS0B65g=="
-CLAUDE_CODE_LINUX_X64_INTEGRITY = "sha512-cUAH9W7KrcfM5v7hWjvv1rurvAAgvOe+BVfOlk17sXH3Vqh9V+tVj0WZin6RiJ8MiZ7RpEtVfaVKPcgrY3x6Vw=="
-CODEX_VERSION = "0.167.2"
-CODEX_INTEGRITY = "sha512-6OFkr2ndzTdFb32OEiUlM9BgpeY8+wnMe8vRhuvt+22TnxVR39KnJ22Ghay98IY9OmEltoNgFN4GALUkxFQCOw=="
-GROK_VERSION = "1.0.77"
-GROK_INTEGRITY = "sha512-zNGi+PGXR/cxL3URtxEIHX91Lm06jOb28ra98FWEO9keIJOO83Pr67rpmLtwufp7A51NvMM4Nm0Kh77/9l9rQg=="
-CLAUDE_AGENT_ACP_VERSION = "0.106.0"
-CLAUDE_AGENT_ACP_INTEGRITY = "sha512-jfwcUc7J+KTIOqsPPSDzCgh4WI+QgvbPEACPtibMV1e41spmsR2Wb5xEeO1lh0el/kLxi7nF3zqZ1RYpdoVw7Q=="
+CLAUDE_CODE_VERSION = "2.1.325"
+CLAUDE_CODE_INTEGRITY = "sha512-OUxCb0sx734zJh9zGTP9oF01gZ44DCGFaw7hgD4byepjRRGyvHzgUOwC7dlCgVIljV6CiEVDjq+anY3GUvKFQw=="
+CLAUDE_CODE_LINUX_X64_INTEGRITY = "sha512-BqZzMvP/zgLLL34S+7OzbG+cyoFp7gwWHU5koVwsyMlTAz+0zZAmbY+UkzvtN2RXxp6AcMenbYIjQJxoXfUY3w=="
+CODEX_VERSION = "0.172.0"
+CODEX_INTEGRITY = "sha512-yHf/6wbw4Zvha2M2ylDhDrU9FgfKLYgV6xSzSjlz3gxQNsiVLkXo+fPGwBqvP0A5geLtZs9wAbq+1v7+ZVWJ0g=="
+GROK_VERSION = "1.0.92"
+GROK_INTEGRITY = "sha512-tLFJjet/By28ylFusdhM+KXA5wlWxYBkhptW6sUbnuPicmROj23f57IIeWULK+VlKIA0pARkI4GKfdjwB1ol3w=="
+CLAUDE_AGENT_ACP_VERSION = "0.112.0"
+CLAUDE_AGENT_ACP_INTEGRITY = "sha512-T9FrKGd9eDKHNmZE/EfEf01v49UHKeKyGcu91O8sdVc7a9eMEDOGWT/0moWirGHJdBqJ9qPVfqu07IBegJuniA=="
 CLAUDE_ACP_PLUGIN_SOURCE = "https://github.com/mvdbastos/hermes-acp-agents"
 CLAUDE_ACP_PLUGIN_REVISION = "0526610a3945cc376ac517b63ca358a5b838a2fc"
 
@@ -186,7 +186,7 @@ class FleetImageReleaseTests(unittest.TestCase):
                 "@anthropic-ai/claude-code": CLAUDE_CODE_VERSION,
                 "@openai/codex": CODEX_VERSION,
                 "@xai-official/grok": GROK_VERSION,
-                "opencode-ai": "1.19.5",
+                "opencode-ai": "1.19.6",
             },
         )
         self.assertTrue(package["private"])
