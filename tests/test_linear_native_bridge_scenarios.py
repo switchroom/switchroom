@@ -689,8 +689,8 @@ class NativeBridgeScenarios(unittest.TestCase):
         done = [body for body in remote.bodies(ISSUE) if body.startswith("Done.")]
         self.assertEqual(len(done), 1)
         self.assertIn("CI/CD passed.\n\nNext: read/write split, and/or deploy.", done[0])
-        self.assertIn("**Remaining**\n\n- Nothing; logs in `out.log`", done[0])
-        self.assertNotIn("/opt/data", done[0])
+        # HF-823: the closing note names files in full, as the worker wrote them.
+        self.assertIn("**Remaining**\n\n- Nothing; logs in /opt/data/runs/42/out.log", done[0])
 
     def test_delayed_progress_and_completion_flush_reaches_done_once(self):
         clock, remote, reporter, task_id = self.reporting_fixture("delayed-completion")
@@ -1967,6 +1967,32 @@ class NativeBridgeScenarios(unittest.TestCase):
         self.assertTrue(remote.project_updates)
         self.assertFalse(reporter.store.pending())
 
+    def test_issue_opened_and_closed_within_ten_minutes_gets_no_project_update(self):
+        # HF-823: a quick throwaway or fix is said on the issue; the project update is for real news.
+        from linear_fake_api import Clock, FakeLinear
+        from hermes_fleet_linear_plugin.api import LinearAPI
+        for age, expected in ((60, 0), (11 * 60, 1)):
+            with self.subTest(age=age):
+                clock = Clock()
+                remote = FakeLinear(clock)
+                self.addCleanup(remote.close)
+                remote.add_issue(ISSUE, "OPS-1")["createdAt"] = clock.iso(-age)
+                reporter = Bridge(Store(self.home / f"short-lived-{age}.db"),
+                                  LinearAPI(lambda: "synthetic", endpoint=remote.url, clock=clock),
+                                  self.board, profile="default", clock=clock)
+                with self.board.conn() as conn:
+                    task_id = kb.create_task(conn, title="OPS-1: quick task", assignee="default")
+                reporter.track(ISSUE, task_id)
+                with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=clock()):
+                    kb.complete_task(conn, task_id, result="Verified findings: https://example.test/findings")
+                reporter.pump_kanban()
+                clock.now += 10
+                reporter.flush()
+                self.assertEqual(remote.state(ISSUE), "Done")
+                self.assertTrue(any(body.startswith("Done.") for body in remote.bodies(ISSUE)))
+                self.assertEqual(len(remote.project_updates), expected)
+                self.assertFalse(reporter.store.pending())
+
     def test_restart_catchup_preserves_human_state_changed_after_native_event(self):
         from linear_fake_api import Clock, FakeLinear
         from hermes_fleet_linear_plugin.api import LinearAPI
@@ -2123,6 +2149,74 @@ class NativeBridgeScenarios(unittest.TestCase):
             self.assertFalse(reporter.store.pending())
         self.assertIn("- [X] PR merged", remote.issues[ISSUE]["description"])
         self.assertFalse(reporter.store.plan_state(ISSUE).get("backoff"))
+
+    def test_lost_plan_edit_that_linear_rewrote_settles_and_the_final_plan_lands(self):
+        # HF-813 (HF-823): the first plan edit applied but its response was lost. Linear stored the
+        # section as `- [X]` on items holding inline code, with blank lines added; the retry's readback
+        # did not see the agent's own text, so this and every later update became comments and the
+        # final ticked plan never reached the description. Covered both ways: the lost row retried
+        # first, and a newer update sent before that retry.
+        import re
+        plan_1 = ("## Plan and progress (agent)\nStatus: both values read.\n"
+                  "- [x] Report the sha256 of `/opt/hermes/plugins/linear/plugin.yaml`: `7c104c4b3759`\n"
+                  "- [ ] Post a checkpoint\n  - [x] plan section posted\n  - [ ] complete")
+        plan_2 = plan_1.replace("- [ ] Post a checkpoint", "- [x] Post a checkpoint").replace("  - [ ] complete", "  - [x] complete")
+        for order in ("retry_first", "newer_first"):
+            with self.subTest(order=order):
+                clock, remote, reporter, task_id = self.plan_fixture("plan-lost-rewrite-" + order)
+                original = remote._apply
+                def linear_editor(query, variables, original=original):
+                    status, payload = original(query, variables)
+                    fields = (variables or {}).get("input") or {}
+                    if "issueUpdate" in query and isinstance(fields.get("description"), str):
+                        text = re.sub(r"^(## .+)\n(?!\n)", r"\1\n\n", fields["description"], flags=re.M)
+                        text = re.sub(r"^(Status: .*)\n(- )", r"\1\n\n\2", text, flags=re.M)
+                        remote.issues[variables["id"]]["description"] = re.sub(r"^(\s*- )\[x\]", r"\1[X]", text, flags=re.M)
+                    return status, payload
+                remote._apply = linear_editor
+                remote.lose_next_response = True
+                self.plan_update(clock, reporter, task_id, plan_1)  # applied, response lost: retried later
+                self.assertIn("- [X] Report the sha256", remote.issues[ISSUE]["description"])
+                if order == "retry_first":
+                    clock.now += 120
+                    reporter.flush()
+                    self.assertFalse(reporter.store.pending())
+                    self.plan_update(clock, reporter, task_id, plan_2)
+                else:
+                    self.plan_update(clock, reporter, task_id, plan_2)  # the newer update goes first
+                    clock.now += 120
+                    reporter.flush()  # the older retry does not write over it
+                description = remote.issues[ISSUE]["description"]
+                self.assertTrue(description.startswith(self.HUMAN_TEXT + "\n\n## Plan and progress (agent)"))
+                self.assertEqual(description.count("## Plan and progress (agent)"), 1)
+                self.assertIn("- [X] Post a checkpoint", description)
+                self.assertIn("  - [X] complete", description)
+                self.assertEqual(remote.comments, [])
+                self.assertFalse(reporter.store.pending())
+                self.assertFalse(reporter.store.plan_state(ISSUE).get("backoff"))
+
+    def test_completion_during_a_status_pass_goes_straight_to_done(self):
+        # HF-813 (HF-823): the task finished between the pump's history read and the status pass,
+        # which then saw a done task with its completion not yet consumed and wrote In Review
+        # about five seconds before the closeout wrote Done.
+        import json, sqlite3
+        clock, remote, reporter, task_id = self.reporting_fixture("no-review-flick")
+        reporter.flush()
+        self.native_progress(clock, task_id)
+        reporter.pump_kanban()
+        reporter.flush()
+        self.assertEqual(remote.state(ISSUE), "In Progress")
+        self.complete_reported_task(clock, task_id)
+        reporter._reconcile_status(reporter.store.get(ISSUE), reporter._binding_adapter(ISSUE))
+        reporter.pump_kanban()
+        clock.now += 10
+        reporter.flush()
+        self.assertEqual(remote.state(ISSUE), "Done")
+        with sqlite3.connect(reporter.store.path) as db:
+            states = [json.loads(payload).get("state") for (payload,) in
+                      db.execute("SELECT payload FROM outbox WHERE kind = 'status' ORDER BY rowid")]
+        self.assertNotIn("in_review", states)
+        self.assertEqual(states[-1], "done")
 
     def test_plan_update_from_another_author_or_closed_issue_changes_nothing(self):
         clock, remote, reporter, task_id = self.plan_fixture("plan-foreign")

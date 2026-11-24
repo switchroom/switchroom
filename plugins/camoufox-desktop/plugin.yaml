@@ -1,5 +1,5 @@
 name: camoufox-desktop
-version: 0.3.0
+version: 0.4.0
 description: >
   Bot Desktop glue for the official camofox plugin and the image's local camofox-browser
   service: the camofox browser tools and browser_vault writes wait while a human holds Take over,
@@ -9,10 +9,19 @@ description: >
   gets a Camoufox icon that opens the agent's own session. Password-field values (type=password,
   autocomplete current-password/new-password) are removed from what the page-reading camofox
   tools return, whoever typed them (tool_execution middleware; transform_tool_result on an
-  older core).
+  older core). The browser tools follow a popup an action opens and, after a hand-back, the tab
+  the human left in front; browser_tabs lists, switches and closes the agent's own tabs; tabs stay
+  alive during Take over, agent popups no longer in use close at the end of a turn and a
+  session's untracked tabs close when it ends; an empty first
+  snapshot after navigate is re-read until the page renders; a screen handoff names the browser
+  and the live tab and brings that Camoufox tab to front.
 author: Hermes Fleet Contributors
 kind: standalone
+provides_tools:
+  - browser_tabs
 provides_hooks:
   - pre_tool_call
   - pre_llm_call
+  - on_session_end
+  - on_session_finalize
   - transform_tool_result

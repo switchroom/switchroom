@@ -1002,9 +1002,20 @@ jobs:
         env:
           SHA_TAG: ${{ env.IMAGE_REPOSITORY }}:sha-${{ github.sha }}
           STAGED_DIGEST: ${{ steps.publish.outputs.digest }}
+        # GHCR tag writes are eventually consistent: a read straight after imagetools create
+        # can answer "not found" or a previous attempt's digest. Wait (bounded) for the tag to
+        # converge; the verdict is still exact equality with the staged digest.
         run: |
           set -euo pipefail
-          promoted_digest=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$SHA_TAG")
+          promoted_digest=""
+          for attempt in $(seq 1 12); do
+            promoted_digest=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$SHA_TAG" 2>/dev/null) || promoted_digest=""
+            if [ "$promoted_digest" = "$STAGED_DIGEST" ]; then
+              break
+            fi
+            printf 'attempt %s: SHA tag resolves to %s, waiting for registry\n' "$attempt" "${promoted_digest:-nothing}"
+            sleep 5
+          done
           test -n "$promoted_digest"
           test "$promoted_digest" = "$STAGED_DIGEST" || {
             printf '%s\n' 'promoted SHA tag does not resolve to staged digest' >&2

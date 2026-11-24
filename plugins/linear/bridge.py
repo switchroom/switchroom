@@ -58,6 +58,21 @@ def standing_pr_park(events: list):
     if last is None or last.kind != "blocked" or native_event_payload(last).get("source") != PR_PARK_SOURCE:
         return None
     return last
+# What core records after a worker's own block as that run winds down (HF-822): the interpreter's
+# ``worker_result`` and a late heartbeat. Only events of the park's own run; anything else after
+# the park (a comment, Stop, answer, unblock or new block) still supersedes it.
+PARK_TRAIL = frozenset({"worker_result", "heartbeat"})
+def park_trail(event, park) -> bool:
+    """Whether ``event`` is the parking run winding down rather than something new."""
+    return event.kind in PARK_TRAIL and park.run_id is not None and event.run_id == park.run_id
+def park_tail(events: list, park):
+    """The newest event when everything after ``park`` is its own run winding down, else None.
+
+    Core's guarded unblock needs the newest event id, so callers pass this one's id."""
+    after = [event for event in events if event.id > park.id]
+    if not all(park_trail(event, park) for event in after):
+        return None
+    return after[-1] if after else park
 def standing_wait(events: list):
     """(event, wait) for a worker's dependency wait that is the newest block-lifecycle event, else (event, None).
 
@@ -596,9 +611,19 @@ def _trim_at_boundary(text: str, limit: int) -> str:
             return text[:cut].rstrip()
     cut = window.rstrip().rfind(" ")
     return (text[:cut] if cut > 0 else text[:limit]).rstrip() + "\u2026"
-def _project_summary(text: str, limit: int = 300, *, one_line: bool = False) -> str:
-    """Human-readable result text: secrets redacted, local paths in words, internal ids out, Markdown kept."""
-    masked = _readable(_mask_local_paths(_public(text)))
+def _full_path_link(match: re.Match) -> str:
+    """A link to a file on the agent's machine cannot open for the reader: keep its words and the full path."""
+    target = match.group(2)
+    if not (_LOCAL_PATH.fullmatch(target) and _machine_path(target)):
+        return match.group(0)
+    return f"{match.group(1)} (`{target[len('file://'):] if target.startswith('file://') else target}`)"
+def _project_summary(text: str, limit: int = 300, *, one_line: bool = False, keep_paths: bool = False) -> str:
+    """Human-readable result text: secrets redacted, internal ids out, Markdown kept.
+
+    Local paths become words or file names, except with ``keep_paths``: a closing note names the
+    files it changed or read in full (HF-823), only an unopenable local link loses its link."""
+    public = _public(text)
+    masked = _readable(_MD_LINK.sub(_full_path_link, public) if keep_paths else _mask_local_paths(public))
     if one_line:
         masked = " ".join(masked.split())
     else:
@@ -622,7 +647,7 @@ def _done_body(summary: str, evidence: list[str]) -> str:
 PROJECT_LINE_LIMIT = 1200
 def _project_line(summary: str, evidence: list[str]) -> str:
     """A finished issue's line in a project update: the closing note, trimmed at a readable boundary."""
-    short = _project_summary(summary, PROJECT_LINE_LIMIT)
+    short = _project_summary(summary, PROJECT_LINE_LIMIT, keep_paths=True)
     if short != summary.strip():
         short += "\n\nThe full summary is on the issue."
     return _done_body(short, evidence)
@@ -1878,7 +1903,7 @@ class Bridge:
                 return None
             contract = task.completion_contract or "local-only"
             evidence = [contract] if contract.startswith("https://") else evidence_links(adapter.evidence_text(task))
-            summary = _project_summary(adapter.completion_summary(task), 4000)
+            summary = _project_summary(adapter.completion_summary(task), 4000, keep_paths=True)
             # Linear shows a session response as a thread comment. The closeout already posts (or
             # will post) the result as this completion's issue comment, so point at it (HF-809).
             from .outcome import POINTER_BODY, captured_body
@@ -3539,6 +3564,9 @@ class Bridge:
                 # state this app set becomes Todo (send time checks the app made the last move).
                 payload = {"state": "todo", "source_ms": archived.created_at * 1000, "archived": True}
             else:
+                if task.status == "done" and any(event.kind == "completed" and event.id > row["last_event_id"]
+                                                 for event in adapter.history(task.id, row["last_event_id"])):
+                    return  # The pump closes it out as Done when it reaches the completion: no In Review flick (HF-823).
                 last = next(iter(adapter.history(task.id, row["last_event_id"] - 1)), None) if row["last_event_id"] else None
                 state = self._native_state(task, adapter, last)
                 turn = state == "todo" and self._session_turn_active(row["issue_id"])
@@ -3819,7 +3847,7 @@ class Bridge:
             return
         contract = task.completion_contract or "local-only"
         raw_summary = adapter.completion_summary(task)
-        summary = _project_summary(raw_summary, 4000)
+        summary = _project_summary(raw_summary, 4000, keep_paths=True)
         if not self._completion_scope_matches(row["issue_id"], task, adapter):
             if recheck is not None:
                 return
@@ -3955,7 +3983,7 @@ class Bridge:
         """Let work core's open-PR guard parked run again once that PR has merged or closed.
 
         Only the guard's own park (the newest block-lifecycle event is its ``blocked`` event) of a
-        native binding, already reported, with no later event of any kind. Local reads only until
+        native binding, already reported, with no later event beyond its own run winding down. Local reads only until
         the persisted gap (2 min doubling to 1 h) has passed; the next gap is taken before asking
         GitHub. A merged or closed PR gets one guarded core unblock of exactly that park event,
         decided once per park (a durable marker written before the call, never replayed). An open
@@ -3975,8 +4003,8 @@ class Bridge:
         marker, fields = f"pr-park-resume:{issue_id}:{task.id}:{park.id}", {"iss": issue_id, "task": task.id, "evt": park.id}
         if self.store.native_intent(marker):
             return  # Decided once for this park.
-        if events[-1].id != park.id:
-            # Core's guarded unblock needs the park to be the newest event; something happened since.
+        if park_tail(events, park) is None:
+            # Something happened since the park (beyond its own run winding down).
             diag.transition("pr_park.resume", "skipped", "pr_park_changed", key=marker, **fields)
             return
         key, now = f"pr_park_recheck:{issue_id}:{task.id}:{park.id}", self.clock()
@@ -3999,8 +4027,9 @@ class Bridge:
             diag.transition("pr_park.resume", "skipped", "pr_open", key=marker, next_s=int(until - now), **fields)
             return
         latest = adapter.history(task.id, 0)
+        tail = park_tail(latest, park)
         if (adapter.require_task(task.id).status != "blocked" or getattr(standing_pr_park(latest), "id", None) != park.id
-                or latest[-1].id != park.id):
+                or tail is None):
             diag.transition("pr_park.resume", "skipped", "pr_park_changed", key=marker, **fields)
             return
         _, first = self.store.native_intent_prepare(marker, {"issue_id": issue_id, "task_id": task.id,
@@ -4009,7 +4038,7 @@ class Bridge:
             return
         diag.evt("pr_park.resume", "started", "pr_park_resolved", **fields)
         try:
-            accepted = adapter.resume_pr_park(task.id, park.id)
+            accepted = adapter.resume_pr_park(task.id, tail.id)
         except Exception as exc:  # Uncertain: the marker stays unsettled and is never replayed.
             self.store.native_intent_settle(marker, {"state": "reconcile", "reason": type(exc).__name__})
             diag.warn("pr_park.resume", "failed", diag.exc_reason(exc), exc=type(exc).__name__, **fields)
@@ -4023,7 +4052,8 @@ class Bridge:
         """Resume a worker's dependency block once the other issues are closed and any delivery gate holds.
 
         Only the worker's own block (the newest block-lifecycle event, re-kinded by core for lack of a
-        native parent; see waits.py), already reported, with no later event. Local reads until the
+        native parent; see waits.py), already reported, with no later event beyond its own run winding
+        down (``park_tail``). Local reads until the
         persisted gap has passed; then one read per named issue and one local file check per gate.
         Satisfied: one plain core unblock while that block is still the newest event, decided once
         per block (a durable marker written before the call, never replayed); a Stop that lands in
@@ -4032,7 +4062,7 @@ class Bridge:
 
         A CI gate (HF-800) is satisfied once CI on its head has finished or its window has passed.
         The verdict is written as a native task comment first and the unblock is guarded on that
-        comment being the only event since the block, so the resumed worker reads the verdict and a
+        comment being the only new event since the block, so the resumed worker reads the verdict and a
         Stop that lands in between still wins. A second park on the same task trips core's
         block-loop breaker into triage; that ``block_loop_detected`` carries the same wait and
         resumes the same way, up to ``waits.CI_MAX_PARKS`` CI parks per task.
@@ -4044,7 +4074,7 @@ class Bridge:
             return
         events = adapter.history(task.id, 0)
         last, wait = standing_wait(events)
-        if (last is None or wait is None or last.id > row["last_event_id"] or events[-1].id != last.id
+        if (last is None or wait is None or last.id > row["last_event_id"] or park_tail(events, last) is None
                 or task.status != ("triage" if last.kind == "block_loop_detected" else "blocked")):
             return
         issue_id = row["issue_id"]
@@ -4082,23 +4112,25 @@ class Bridge:
             diag.transition("external_wait.resume", "skipped", "ci_pending", key=marker, **fields)
             return
         latest = adapter.history(task.id, 0)
-        if adapter.require_task(task.id).status != task.status or latest[-1].id != last.id:
+        tail = park_tail(latest, last)
+        if adapter.require_task(task.id).status != task.status or tail is None:
             diag.transition("external_wait.resume", "skipped", "wait_changed", key=marker, **fields)
             return
         _, first = self.store.native_intent_prepare(marker, {"issue_id": issue_id, "task_id": task.id, "block_event_id": last.id})
         if not first:
             return
-        token = last.id
+        token = tail.id
         try:
             if verdict is not None:
                 adapter.comment(task.id, waits.verdict_comment(verdict), marker=marker)
                 since = adapter.history(task.id, last.id)
-                if len(since) != 1 or since[0].kind != "commented":
+                news = [event for event in since if not park_trail(event, last)]
+                if len(news) != 1 or news[0].kind != "commented":
                     # Something else happened beside the verdict (a Stop, an answer): it wins.
                     self.store.native_intent_settle(marker, {"state": "applied", "accepted": False})
                     diag.transition("external_wait.resume", "skipped", "wait_changed", key=marker, **fields)
                     return
-                token = since[0].id
+                token = since[-1].id
             accepted = adapter.resume_wait(task.id, token)
         except Exception as exc:  # Uncertain: the marker stays unsettled and is never replayed.
             self.store.native_intent_settle(marker, {"state": "reconcile", "reason": type(exc).__name__})
@@ -5008,13 +5040,17 @@ class Bridge:
     def _send_plan_section(self, row: dict[str, Any]) -> bool:
         """Edit the agent's section at the end of the issue description silently, or post it as a comment.
 
-        The section is the agent's only while it is what this bridge last wrote there, or what this
-        same row may have written before a lost response. When a person edited or removed it, or the
+        The section is the agent's only while it is what this bridge last wrote there, or what an
+        edit of this bridge may have written before a lost response (HF-823: read back on the retry
+        or on the next update, it settles as the agent's own edit). An update older than the one
+        already written is not sent again over it. When a person edited or removed it, or the
         guarded replacement is refused, the plan goes back to people: this and later updates are
         regular comments (an unchanged update is not repeated) and the description is left alone.
         Text above the section is never rewritten."""
         payload = row["payload"]
         issue_id, section, fallback = payload["issue_id"], payload["native_plan_section"], payload["body"]
+        order = payload.get("native_history_event_id")
+        order = order if isinstance(order, int) and not isinstance(order, bool) else None
         chosen: dict[str, str] = {}
         def as_comment(state: dict) -> None:
             if state.get("last_comment") == section and state.get("comment_row") != row["id"]:
@@ -5027,6 +5063,10 @@ class Bridge:
             state = self.store.plan_state(issue_id)
             if state.get("backoff"):
                 return as_comment(state)
+            newest = state.get("written_event")
+            if order is not None and isinstance(newest, int) and order < newest:
+                chosen["mode"] = "superseded"  # A newer update is already in the description.
+                return
             current = self.api.issue(issue_id)
             if not isinstance(current, dict) or current.get("id") != issue_id:
                 raise LinearError("Description target could not be verified")
@@ -5034,9 +5074,10 @@ class Bridge:
             human, tail = plan_split(description)
             if tail is not None and markdown_matches(tail, section):
                 chosen["mode"] = "description"  # Already there, including after a lost response.
-                self.store.plan_record(issue_id, written=section, pending=None, pending_row=None)
+                self.store.plan_record(issue_id, written=section, written_event=order, pending=None, pending_row=None)
                 return
-            written, pending = state.get("written"), state.get("pending") if state.get("pending_row") == row["id"] else None
+            # What this bridge last sent, by this row or an earlier one whose response was lost.
+            written, pending = state.get("written"), state.get("pending")
             ours = (not written) if tail is None else bool(
                 (written and markdown_matches(tail, written)) or (pending and markdown_matches(tail, pending)))
             if not ours:
@@ -5052,7 +5093,7 @@ class Bridge:
                 diag.evt("content.write", "skipped", "plan_section_guard", iss=issue_id[:8])
                 return as_comment(self.store.plan_state(issue_id))
             chosen["mode"] = "description"
-            self.store.plan_record(issue_id, written=section, pending=None, pending_row=None)
+            self.store.plan_record(issue_id, written=section, written_event=order, pending=None, pending_row=None)
         self._mutate_outbox(row["id"], write)
         if chosen.get("mode") == "comment":
             verify = getattr(self.api, "verify_comment", None)
@@ -5255,6 +5296,14 @@ class Bridge:
         elif kind == "project_update":
             return self._send_project_update(row["id"])
         return False
+    SHORT_LIVED_MS = 10 * 60 * 1000  # an issue opened and closed within this is not project news (HF-823)
+    def _short_lived(self, issue: dict[str, Any]) -> bool:
+        """Created and closed within SHORT_LIVED_MS: a quick probe or fix, said on the issue alone."""
+        created = iso_ms(issue.get("createdAt")) if issue.get("createdAt") else 0.0
+        if not created or (issue.get("state") or {}).get("type") not in CLOSED:
+            return False
+        closed = iso_ms(issue.get("completedAt")) if issue.get("completedAt") else self.clock() * 1000
+        return 0 <= closed - created < self.SHORT_LIVED_MS
     def _send_project_update(self, row_id: str) -> bool:
         if not self.store.delivery_allowed(row_id):
             raise ProjectUpdateDeferred
@@ -5309,7 +5358,8 @@ class Bridge:
                 released = delegate is None and terminal_id and self.store.verified_release(terminal_id)
                 if ((not self._report_delegate_allowed(issue, {**payload, "task_id": task.id}) and not released) or
                         (issue.get("state") or {}).get("type") == "canceled" or
-                        ((issue.get("state") or {}).get("type") in CLOSED and not terminal_id)):
+                        ((issue.get("state") or {}).get("type") in CLOSED and not terminal_id) or
+                        self._short_lived(issue)):
                     continue
                 lines_to_send.append(_update_line(ident, line))
                 issue_ids_to_send.append(issue["id"])
@@ -5377,6 +5427,20 @@ class Bridge:
             self._drain_ingress(database, limit, retry_now=retry_now)
         finally:
             self._draining -= 1
+    ROUTED_MEMORY = 1024
+    def _first_route(self, agent: str, delivery: str) -> bool:
+        """True the first time this process hands a delivery to native input (HF-823).
+
+        Until native input commits and ACKs it, the delivery stays pending and every drain hands it
+        over again; the receiver keeps one submission per delivery, so only the first is routing."""
+        routed = self.__dict__.setdefault("_routed_deliveries", {})
+        key = (agent, delivery)
+        if key in routed:
+            return False
+        routed[key] = None
+        while len(routed) > self.ROUTED_MEMORY:
+            routed.pop(next(iter(routed)))
+        return True
     def _drain_ingress(self, database: Path, limit: int, *, retry_now: bool) -> None:
         if not Path(database).exists():
             return
@@ -5398,7 +5462,8 @@ class Bridge:
                         routed = self.native_ingress(InboxDelivery(
                             Path(database), self.ingress_profile, agent, delivery, payload))
                         if routed:
-                            diag.webhook(event, delivery, reason="native_routed")
+                            if self._first_route(agent, delivery):
+                                diag.webhook(event, delivery, reason="native_routed")
                             continue  # Only the native committed-input hook may ACK it.
                     diag.clear()
                     diag.webhook(event, delivery, self.handle_webhook(event), bound=self.store.get)
@@ -5406,6 +5471,7 @@ class Bridge:
                     status = "invalid"
                     diag.warn("webhook.delivery", "refused", "invalid_payload", evt=delivery)
                 except Exception as exc:  # noqa: BLE001 - keep the inbox moving; back off for a day, then park it loudly
+                    self.__dict__.get("_routed_deliveries", {}).pop((agent, delivery), None)  # a retry routes it anew
                     status = "failed" if self.clock() - float(received) > 86_400 else "pending"
                     if attempts and status == "pending":
                         diag.warn("webhook.delivery", "retry", "delivery_failed", evt=delivery, attempt=attempts + 1, exc=type(exc).__name__)

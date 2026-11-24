@@ -80,7 +80,8 @@ adds the Bot Desktop behaviour without patching it:
   and the camofox plugin only scrubs vault values and token-like text, so a password a human typed
   during Take over would otherwise show up in the next snapshot. After `browser_navigate`,
   `browser_snapshot`, `browser_console`, `browser_vision` and `browser_get_images`, the plugin asks
-  each of the agent's tabs for the values of its password fields (`type=password`, or `autocomplete`
+  the tab the output came from (the task's tracked tab, and the opener when the call followed a
+  popup; every tab only when no tab is tracked) for the values of its password fields (`type=password`, or `autocomplete`
   `current-password` / `new-password`, including open shadow roots and same-origin frames) and
   removes them from the output and from the stored full-snapshot file. It fails closed: if the scan
   cannot run, every textbox value in the snapshot is masked and a `browser_console` result is
@@ -89,8 +90,38 @@ adds the Bot Desktop behaviour without patching it:
   `scripts/camoufox-password-smoke.py` proves it on a live agent: a throwaway identity, a password
   typed with XTest key events on the Bot Desktop, then the three read tools through the real
   middleware chain (`--plugin-b64` tests a candidate before it is delivered).
-- A short system-prompt section steers the model: Camoufox first, Chromium for CDP-only jobs, and a
-  CAPTCHA or challenge always goes to the human.
+- Tabs (HF-826). camofox-browser registers every `window.open` / `target=_blank` popup as a managed
+  tab in the opener's tab group, but the camofox plugin tracks one tab per task and never moves to
+  a popup. The plugin closes that gap without editing the vendored code:
+  - Popup follow: around `browser_click`, `browser_press`, `browser_type`, `browser_console` and
+    `browser_navigate` it diffs the group's tab list (a click, key press or script waits up to 0.5 s
+    for a late popup) and moves the session onto the new tab; the result carries
+    `popup_opened: {tab_id, url, opener_tab_id}`.
+  - Hand-back: the session adopts the tab the human left visible and focused (else the newest
+    visible one, else the group's newest), and the hand-back note says which URL the tools are now
+    on. A Take over the agent was not waiting on is caught on its next camofox call; an input action
+    whose ref came from the old tab is refused once (`tab_changed_after_takeover`).
+  - `browser_tabs` (toolset `camofox`, so it is fenced during Take over) lists, switches and closes
+    the task's own tabs: its userId and session-key group only. Its output is password-scrubbed.
+  - Orphans and the idle reaper: the server closes a tab that has had no tool call for
+    `TAB_INACTIVITY_MS` (8 h in this image, set by `service-run`; 5 min upstream), and the per-session
+    tab cap refuses new tabs once reached. The password scrub now evaluates only the tracked tab, so
+    an orphan's tool-call count stops moving and it can idle out. Because 8 h is long, agent popups the
+    session no longer uses are also closed at the end of each turn (the tracked tab and its opener
+    stay, a sign-in popup posts back to its opener; tabs a human opened stay; nothing is closed while
+    the agent waits for a hand-back or a human holds the screen). When a session finalizes, its group's
+    other untracked tabs close too. While a human holds the screen every tab of the agent's tracked
+    groups is touched each minute (`CAMOFOX_KEEPALIVE_SECONDS`, `0` turns it off), so a Take over
+    longer than the idle period cannot lose its tab.
+  - Navigate returns at commit, so a JavaScript-heavy page can snapshot empty. When navigate reports
+    0 elements the snapshot is re-read every 0.5 s until elements appear or it stops changing, for at
+    most 10 s.
+  - `screen_handoff action=link`: the reason names the browser and the live tab (`... in Camoufox
+    (host/path)`, or Chromium after `browser_exec`), and the Camoufox tab is brought to front before
+    the person takes over.
+- A short system-prompt section steers the model: Camoufox first, Chromium for CDP-only jobs, a
+  CAPTCHA or challenge always goes to the human, and how to handle popups in each browser
+  (`browser_tabs`; in `browser_exec`, `list_tabs()`, `switch_tab()` and `close_tab()`).
 - The dock gets a Camoufox icon. It opens or raises the agent's own session (the same Camofox
   `userId` the agent uses), never a second browser.
 

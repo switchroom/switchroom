@@ -139,15 +139,23 @@ def _targets(client: camoufox_local.Client, user_ids: Iterable[str]) -> list[tup
 
 
 def scan(user_ids: Iterable[str], client: Optional[camoufox_local.Client] = None,
-         budget: float = SCAN_BUDGET_SECONDS) -> Scan:
-    """The password-field values open in the agent's Camofox tabs. Raises ScanFailed."""
+         budget: float = SCAN_BUDGET_SECONDS, targets: Optional[Iterable[tuple[str, str]]] = None) -> Scan:
+    """The password-field values open in the agent's Camofox tabs. Raises ScanFailed.
+
+    ``targets`` names the exact ``(userId, tabId)`` pairs whose content the tool output can carry
+    (the tool's tracked tab). Scanning only those matters beyond speed: the evaluate is a tool call to
+    the server, so scanning every tab kept orphan popups from ever idling out (HF-826). Without
+    ``targets`` every tab of ``user_ids`` and of the camofox plugin's sessions is scanned."""
     deadline = time.monotonic() + budget
     try:
         client = client or camoufox_local.Client(key=os.environ.get("CAMOFOX_API_KEY") or None,
                                                  timeout=EVALUATE_TIMEOUT_MS / 1000 + 2)
         values: list[str] = []
         opaque = False
-        for user, tab in _targets(client, user_ids):
+        pairs = list(dict.fromkeys(p for p in targets if p[0] and p[1])) if targets is not None else None
+        if pairs is not None and len(pairs) > MAX_TABS:
+            raise ScanFailed(f"{len(pairs)} tabs open; scanning stops at {MAX_TABS}")
+        for user, tab in pairs if pairs is not None else _targets(client, user_ids):
             if time.monotonic() > deadline:
                 raise ScanFailed("scan ran out of time")
             try:

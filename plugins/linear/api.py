@@ -55,7 +55,7 @@ DIRECTORY_FIELDS = ("nodes { id name slugId completedAt canceledAt archivedAt te
                     "pageInfo { hasNextPage endCursor }")
 # An issue named by its title prefix ("QA-10" for "QA-10: list the commits"): one bounded search.
 TITLE_SEARCH_PAGE = 25
-ISSUE_FIELDS = """id identifier title description url updatedAt completedAt canceledAt creator { id } assignee { id }
+ISSUE_FIELDS = """id identifier title description url createdAt updatedAt completedAt canceledAt creator { id } assignee { id }
   delegate { id name } state { id name type } project { id }
   team { id key states { nodes { id name type position } } }"""
 
@@ -237,6 +237,11 @@ _LIST_START = re.compile(r'(?:[-*+]|1[.)])[ \t]+\S')
 _LIST_ITEM = re.compile(r'[ \t]*(?:[-*+]|[0-9]+[.)])(?:[ \t]|$)')
 _PARAGRAPH_LINE = re.compile(r'[^\s#>|`~<]')
 
+_TASK_BOX = re.compile(r'^([ \t]*(?:[-*+]|[0-9]+[.)]) )\[X\](?=[ \t]|$)')
+def _task_box(line: str) -> str:
+    """Linear stores a ticked task box as ``[X]``, also on an item that holds inline code (HF-823)."""
+    return _TASK_BOX.sub(r'\1[x]', line)
+
 def markdown_matches(actual: object, expected: str) -> bool:
     """Accept narrow editor rewrites, including bare-host autolinks; preserve code/text."""
     if not isinstance(actual, str):
@@ -287,11 +292,11 @@ def markdown_matches(actual: object, expected: str) -> bool:
             if not (prose and inline_run is None and delimiters == 0) or '`' in line:
                 # Inline code, links or HTML: only the editor's text rewrites, and only when the
                 # line does not start inside a construct opened on an earlier line.
-                result.append((_editor_text(line) if prose else line, False))
+                result.append((_task_box(_editor_text(line)) if prose else line, False))
                 continue
             # Escaped text is never a bare-host autolink candidate.
             prose = '\\' not in line
-            line = re.sub(r'^([ \t]*(?:[-*+]|[0-9]+[.)]) )\[X\](?=[ \t]|$)', r'\1[x]', _editor_text(line))
+            line = _task_box(_editor_text(line))
             result.append((re.sub(r'\]\(<((?:[^\s<>()]|\([^\s<>()]*\))+)>\)', r'](\1)', line), prose))
         while fence is None and result and not result[-1][0]:
             result.pop()  # trailing blank lines
