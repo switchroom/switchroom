@@ -485,6 +485,10 @@ class ChatEntrustScenarios(unittest.TestCase):
                 closing = [body for issue_id, body in self.authority.comment_bodies if issue_id == NEW_ISSUE]
                 self.assertTrue(any("Pull request: https://github.com/example/project/pull/12 "
                                     "(open, checks still running)" in body for body in closing), closing)
+                # HF-833: the PR is named once, on its state line, not also as "Evidence:".
+                pr = "https://github.com/example/project/pull/12"
+                self.assertTrue(all(body.count(pr) == 1 and "Evidence: " not in body
+                                    for body in closing if pr in body), closing)
 
     def test_a_second_session_never_takes_over_a_live_adopted_one(self):
         reply = self.create(start_work=True)

@@ -132,13 +132,17 @@ def _progress_text(value: Any, limit: int = 240) -> str:
     return " ".join(str(value or "").split())[:limit]
 def _bridge_comment_author(author: str) -> bool:
     return author == "linear" or author.startswith("linear:")
-def resolve_comment_body(comments, author: str, length: int, *, event_at: int | None = None) -> str:
+def resolve_comment_body(comments, author: str, length: int, *, event_at: int | None = None,
+                         claimed=frozenset()) -> str:
     """Match the comment row written in the same core transaction as the event.
 
     add_comment stores author.strip() and body.strip(), then records the raw
     author and len(raw body). The event timestamp identifies that row. Length
     is only a cross-check. An exact length match is not preferred over another
-    row, and more than one candidate is refused.
+    row, and more than one candidate is refused. ``claimed`` are comment ids
+    another event already names (a checkpoint's own comment, HF-833): such a
+    row is never this event's, so a checkpoint in the same second does not
+    make a plan update ambiguous.
     """
     raw_author = str(author or "")
     stored_author = raw_author.strip()
@@ -153,7 +157,7 @@ def resolve_comment_body(comments, author: str, length: int, *, event_at: int | 
     candidates = []
     earlier = []
     for item in comments:
-        if getattr(item, "author", None) != stored_author:
+        if getattr(item, "author", None) != stored_author or getattr(item, "id", None) in claimed:
             continue
         created = getattr(item, "created_at", None)
         body = item_body(item)
@@ -636,9 +640,13 @@ def _sentence(text: str) -> str:
     # A closing code fence ends the text; an inline `name` still needs its full stop.
     return text if text.endswith((".", "!", "?", "```", ")")) else text + "."
 _EVIDENCE_HEADING = re.compile(r"(?im)^[ \t]*(?:#{1,6}[ \t]*|[*_]{1,2})?evidence\b")
-def _done_body(summary: str, evidence: list[str]) -> str:
-    """The closing note: "Done." then the worker's summary, then any proof links it did not already show."""
-    missing = [link for link in dict.fromkeys(evidence) if link not in summary]
+def _done_body(summary: str, evidence: list[str], *, pr_lines: bool = False) -> str:
+    """The closing note: "Done." then the worker's summary, then any proof links it did not already show.
+
+    With ``pr_lines`` the note is followed by its "Pull request:" state lines (_pr_lines), so a PR
+    link is left to that line instead of being named twice (HF-833)."""
+    missing = [link for link in dict.fromkeys(evidence)
+               if link not in summary and not (pr_lines and PR_URL.fullmatch(link))]
     body = "Done."
     if summary:
         body += ("\n\n" if "\n" in summary or summary.lstrip()[:1] in "*#-_`>|" else " ") + summary
@@ -1204,7 +1212,11 @@ class Kanban:
     def comment_text(self, task_id: str, author: str, length: int, event_at: int) -> str:
         with self.read_conn() as conn:
             comments = self.comments(conn, task_id)
-        return resolve_comment_body(comments, author, length, event_at=event_at)
+            # A human checkpoint writes its comment row with a checkpoint event naming it, not a
+            # commented event: that row cannot be the one a commented event refers to (HF-833).
+            claimed = {event.payload.get("comment_id") for event in self.history_rows(conn, task_id)
+                       if event.kind == "checkpoint" and isinstance(event.payload, dict)}
+        return resolve_comment_body(comments, author, length, event_at=event_at, claimed=claimed)
     def evidence_text(self, task) -> str:
         with self.read_conn() as conn:
             run = self.latest_run(conn, task.id)
@@ -3909,15 +3921,16 @@ class Bridge:
         # older build's closeout of this completion keeps the text it already has (no new PR read).
         from .outcome import captured_body
         prior_body = None if assessment else captured_body(self.store, issue_id, completion)
-        expected = _done_body(summary, evidence)
-        if prior_body is not None and not (prior_body.startswith(expected)
-                                           and _CAPTURED_TAIL.fullmatch(prior_body[len(expected):])):
+        # An older build's text named a PR in "Evidence:" as well as its state line: still this result.
+        if prior_body is not None and not any(prior_body.startswith(expected) and _CAPTURED_TAIL.fullmatch(
+                prior_body[len(expected):]) for expected in (_done_body(summary, evidence, pr_lines=True),
+                                                             _done_body(summary, evidence))):
             prior_body = None  # not this result's text: the identity check refuses it, as before
         head_note = "" if prior_body is not None else _pr_lines(evidence)
         writes = [("status", {"issue_id": issue_id, "state": "done", "task_id": row["task_id"],
                               "evidence": evidence, "native_completion": completion}),
                   ("activity", {"issue_id": issue_id, "session_id": row["owner_ref"], "task_id": row["task_id"],
-                                "content": {"type": "response", "body": ("Assessment completed." if assessment else _done_body(summary, evidence)) + head_note}}),
+                                "content": {"type": "response", "body": ("Assessment completed." if assessment else _done_body(summary, evidence, pr_lines=True)) + head_note}}),
                   ("project_update", {"issue_id": issue_id,
                                       "session_id": self._project_batch(self.store.native_binding(issue_id)), "session_key": "",
                                       "task_id": row["task_id"], "project_id": row["project_id"], "resolve": issue_id,

@@ -2195,6 +2195,28 @@ class NativeBridgeScenarios(unittest.TestCase):
                 self.assertFalse(reporter.store.pending())
                 self.assertFalse(reporter.store.plan_state(ISSUE).get("backoff"))
 
+    def test_final_plan_lands_when_a_checkpoint_and_completion_share_its_second(self):
+        # HF-833 (live HF-831): the start plan, then ~14 s later the final plan, a checkpoint and the
+        # completion in the same second. The checkpoint's own comment row matched the plan's commented
+        # event too, so the plan was refused as ambiguous: no outbox row, the start plan stayed.
+        import uuid
+        clock, remote, reporter, task_id = self.plan_fixture("plan-same-second")
+        self.plan_update(clock, reporter, task_id, self.PLAN_A)
+        self.assertEqual(remote.issues[ISSUE]["description"], self.HUMAN_TEXT + "\n\n" + self.PLAN_A)
+        clock.now += 10
+        with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=clock()):
+            kb.add_comment(conn, task_id, "default", self.PLAN_C)
+            kb.add_comment(conn, task_id, "default", "**Checks verified**\nBoth checks passed.",
+                           human_checkpoint=True, request_id=str(uuid.uuid4()))
+            self.assertTrue(kb.complete_task(conn, task_id, result="Verified both checks; nothing remains"))
+        reporter.pump_kanban()
+        clock.now += 10
+        reporter.flush()
+        self.assertEqual(remote.issues[ISSUE]["description"], self.HUMAN_TEXT + "\n\n" + self.PLAN_C)
+        self.assertTrue(any("Checks verified" in body for body in thread_bodies(remote, ISSUE)))
+        self.assertFalse(any("Plan and progress" in body for body in remote.bodies(ISSUE)))
+        self.assertEqual(remote.state(ISSUE), "Done")
+
     def test_completion_during_a_status_pass_goes_straight_to_done(self):
         # HF-813 (HF-823): the task finished between the pump's history read and the status pass,
         # which then saw a done task with its completion not yet consumed and wrote In Review

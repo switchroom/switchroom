@@ -25,7 +25,7 @@ def prepare(writes, *, issue_id, owner, completion, summary, evidence, head_note
     from .bridge import _done_body
     comment_id = assessment_id or comment_id_for(issue_id, completion)
     if not assessment_id:
-        body = body if body is not None else _done_body(summary, evidence) + head_note
+        body = body if body is not None else _done_body(summary, evidence, pr_lines=True) + head_note
         writes.insert(1, ("comment", dict(id=comment_id, issue_id=issue_id, task_id=completion["task_id"],
             body=body, native_completion=completion, native_outcome_comment=True)))
     result = []
