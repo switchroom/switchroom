@@ -328,7 +328,7 @@ class TitleAliasTests(ResolveBase):
     def test_work_on_starts_the_resolved_issue(self) -> None:
         started = []
 
-        def entrust(bridge, issue, record, context):
+        def entrust(bridge, issue, record, context, **_kw):
             started.append(issue["identifier"])
             return {"native": {"status": "ready", "created_from_chat": True}, "routing": "queued"}
         with patch.object(chat, "_entrust", entrust):
@@ -342,7 +342,7 @@ class TitleAliasTests(ResolveBase):
     def test_a_closed_single_match_is_shown_but_never_started(self) -> None:
         self.remote.set_state("issue-622", "Done")
         started = []
-        with patch.object(chat, "_entrust", lambda bridge, issue, *a: started.append(issue) or {}):
+        with patch.object(chat, "_entrust", lambda bridge, issue, *a, **_kw: started.append(issue) or {}):
             for action in ("work_on", "track", "followup"):
                 with self.subTest(action=action):
                     reply = self.call(action=action, issue="QA-10", task_id="t_0a1b2c3d", body="go",
@@ -435,8 +435,8 @@ class RefusalLogTests(ResolveBase):
     def test_a_resolved_alias_logs_the_key(self) -> None:
         self.remote.add_issue("issue-622", "HF-622", title="QA-10: list the 10 most recent commits",
                               team={"id": "team-hf", "key": "HF"})
-        with patch.object(chat, "_entrust", lambda *a: {"native": {"status": "ready", "created_from_chat": True},
-                                                        "routing": "queued"}):
+        queued = {"native": {"status": "ready", "created_from_chat": True}, "routing": "queued"}
+        with patch.object(chat, "_entrust", lambda *a, **_kw: queued):
             self.call(action="work_on", issue="QA-10")
         self.assertIn("issue=HF-622", self.result_lines()[-1])
 
