@@ -1139,6 +1139,15 @@ class LinearAPI:
             "assignee": issue.get("assignee") is not None, "delegate": delegate is not None and not own_delegate,
             "project": project_id is not None and project.get("id") != project_id,
             "parent": parent_id is not None and parent.get("id") != parent_id})
+    def issue_labels(self, issue_id: str) -> list[str]:
+        """The names of one issue's labels (one small read, made only when a label map is set)."""
+        data = self.graphql("query IssueLabels($id: String!) { issue(id: $id) { id labels(first: 50) "
+                            "{ nodes { name } } } }", {"id": issue_id})
+        issue = data.get("issue")
+        nodes = ((issue.get("labels") or {}).get("nodes") if isinstance(issue, dict) else None)
+        if not isinstance(nodes, list):
+            raise LinearError(f"Linear issue {issue_id} labels unavailable")
+        return [node["name"] for node in nodes if isinstance(node, dict) and isinstance(node.get("name"), str)]
     def team_projects(self, team_id: str) -> list[dict[str, str]]:
         """Active (not completed, canceled or archived) projects of one team, as id and name."""
         data = self.graphql("query TeamProjects($id: String!) { team(id: $id) { id projects(first: 100) "

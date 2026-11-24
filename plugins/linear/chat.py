@@ -103,6 +103,7 @@ SCHEMA = {
         "expected_description": {"type": "string", "description": "Exact current description for replacement preflight; this is not remote compare-and-swap."},
         "project": {"type": "string", "description": "create_issue: project id, exact project name or URL slug of an active project, in any team this app can see; names are matched exactly (ignoring case), never by part of a name. Omitted: the parent's project, else the active project this agent last filed a new issue into for team (or the team's only active project); the reply names the project used. Only when none of those exists is the call refused with the active projects (per team when team is omitted) to choose from. Use \"none\" (with team) only when the work fits no project. Never ask the user for project ids."},
         "start_work": {"type": "boolean", "description": "create_issue: true when the user asked for a longer outcome to be carried out now; starts one native task, delegates the issue to this app and reports back to this chat. false (default) for a quick note or someone else's issue. work_on always starts."},
+        "repo": {"type": "string", "description": "create_issue with start_work, or work_on: the coding project (Hermes project slug, such as web-app) when the work is code in that product's repo; the new task gets its own worktree and branch of the canonical repo. Omit for anything else (it then follows the issue's product label, else a scratch folder). Existing work keeps its workspace."},
         "record_done": {"type": "boolean", "description": "create_issue or work_on: link and close work already finished in this chat; requires summary. Nothing is started or re-run."},
         "summary": {"type": "string", "description": "record_done: what was delivered and what remains, for the closing Linear summary."},
         "evidence": {"type": "array", "items": {"type": "string"}, "description": "record_done: evidence links such as the PR, merged commit, deploy check or findings."},
@@ -628,6 +629,15 @@ def _entrust_request(args: dict, action: str, context: Any) -> tuple[bool, dict 
     return bool(start or done), record
 
 
+def _workspace_request(bridge: Any, args: dict, starts: bool) -> str | None:
+    """Validate ``repo`` before any write: only new work that will run may name a coding project."""
+    if "repo" not in args:
+        return None
+    if not starts:
+        raise ValueError("repo applies only to work being started (create_issue with start_work, or work_on).")
+    return bridge.workspace_choice(args["repo"])
+
+
 def _origin_route(context: Any) -> dict | None:
     """The asking chat as a native notify subscription, as core's kanban_create auto-subscribe builds it."""
     platform, chat_id = context.platform, context.chat_id
@@ -717,7 +727,7 @@ def _entrust_board_pin(bridge: Any, context: Any) -> None:
 
 
 def _entrust(bridge: Any, issue: dict, record: dict | None, context: Any, *, takeover_from: str | None = None,
-             note: str = "", proven_ms: float | None = None) -> dict:
+             note: str = "", proven_ms: float | None = None, workspace: str | None = None) -> dict:
     _entrust_board_pin(bridge, context)
     def route(current: dict, status: str) -> str:
         # Called inside the issue's lock with the issue version read under it, before admission:
@@ -726,7 +736,7 @@ def _entrust(bridge: Any, issue: dict, record: dict | None, context: Any, *, tak
                               replace_delegate=takeover_from)
     native = bridge.entrust(issue["id"], route=None if record else _origin_route(context), record_done=record,
                             route_delegate=route, **({"takeover_from": takeover_from, "note": note, "proven_ms": proven_ms}
-                                                     if takeover_from else {}))
+                                                     if takeover_from else {}), **({"workspace": workspace} if workspace else {}))
     return {"native": native, "routing": native.pop("routing", "held: routing was not checked")}
 
 
@@ -1058,6 +1068,7 @@ def _plan(bridge: Any, args: dict, action: str, context: Any) -> str:
             raise ValueError("create_issue needs a title.")
         parent = _text(args, "parent") or None
         entrust, record = _entrust_request(args, action, context)
+        workspace = _workspace_request(bridge, args, entrust and not record)
         team, project_id, note, refusal = _issue_destination(bridge, team, _text(args, "project"), parent)
         if refusal:
             return refusal
@@ -1080,7 +1091,7 @@ def _plan(bridge: Any, args: dict, action: str, context: Any) -> str:
             return _reply(False, note + "Created the issue, but specialist authorization is fenced, so no work was started.",
                           code="authorization_unavailable", issue=created)
         # The readback carries no issue version; routing needs the current one.
-        result = _entrust(bridge, bridge.api.issue(created["id"]), record, context)
+        result = _entrust(bridge, bridge.api.issue(created["id"]), record, context, workspace=workspace)
         return _reply(True, note + "Created the issue. " + _entrust_message(result) + _stored_differently(created)
                       + _formatting_tip(args.get("description")), issue=created, **result)
     if action == "create_project":
@@ -1282,7 +1293,8 @@ def _issue_action(bridge: Any, args: dict[str, Any], action: str, context: Any, 
             return takeover.hand_off(bridge, args, context, issue, _reply)
         if action == "work_on":
             _, record = _entrust_request(args, action, context)
-            result = _entrust(bridge, issue, record, context)
+            workspace = _workspace_request(bridge, args, not record)
+            result = _entrust(bridge, issue, record, context, workspace=workspace)
             return _reply(True, _entrust_message(result), issue=_issue_ref(issue), **result)
         if action == "delegate_self":
             if context.delegated_child:

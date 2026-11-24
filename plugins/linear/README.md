@@ -577,6 +577,18 @@ with only `command` is dropped, so replace it with `a2a`. `takeover.allow` is th
 `hand_off` acts only on an A2A request whose authenticated peer (core's `A2A_PEER_TOKENS` name)
 is the `a2a` listed for the `to` name it carries; without it nobody can take work over from
 this agent.
+Optional `workspace_projects` maps Linear label names (matched ignoring case) to this profile's
+Hermes project slugs (`hermes project list`), for example `web-app: web-app`. A new
+task for an issue whose labels name exactly one mapped project is created with that project:
+native Kanban gives it its own worktree at `<repo>/.worktrees/<task-id>` on branch
+`<slug>/<task-id>-<title>`, cut from the canonical clone's HEAD, and removes the worktree when the
+task finishes clean with its commits pushed (dirty or unpushed work is kept). No mapped label, two
+different mapped projects, `record_done`, an existing task, or a slug this profile has not
+registered all leave the task in its scratch folder. One label read is made per created task,
+and only when the map is set. From chat, `create_issue` with `start_work` and `work_on` accept
+`repo` naming one of the mapped slugs; it wins over the labels and is refused before any write
+when it is not mapped.
+
 Linear status follows the bound native task: queued (ready, todo, scheduled) shows Todo,
 running shows In Progress, review or a task held by the open-PR guard shows In Review,
 blocked or triage shows the team's Blocked state, and finished work whose outcome is not
