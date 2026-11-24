@@ -1242,6 +1242,9 @@ def _handle(bridge: Any, args: dict[str, Any], context: Any) -> str:
     action = _text(args, "action")
     if action not in SCHEMA["parameters"]["properties"]["action"]["enum"]:
         return _reply(False, "Use track/status for native reporting or a supported content action.", code="unsupported_action")
+    refusal = cron_refusal(args, action, context)
+    if refusal:
+        return refusal
     try:
         if action in {"create_issue", "create_project", "link_issue"}:
             return _plan(bridge, args, action, context)
@@ -1263,6 +1266,18 @@ def _handle(bridge: Any, args: dict[str, Any], context: Any) -> str:
         return _issue_action(bridge, args, action, context, issue)
     except (ValueError, LinearError, transport.Unavailable) as exc:
         return _reply(False, str(exc), code="request_refused")
+
+
+def cron_refusal(args: dict[str, Any], action: str, context: Any) -> str | None:
+    """A scheduled run files and edits content as this app; it never starts, owns or routes work."""
+    if not transport.is_cron(context):
+        return None
+    if (action in transport.CRON_ACTIONS and args.get("start_work", False) is False
+            and args.get("record_done", False) is False):
+        return None
+    return _reply(False, "A scheduled job can read issues and create, comment, describe or link them; "
+                  "starting, finishing, tracking, routing or handing over work needs a person's chat. "
+                  "Nothing was changed; report the item in the job's output instead.", code="cron_scope_refused")
 
 
 def _issue_action(bridge: Any, args: dict[str, Any], action: str, context: Any, issue: Any) -> str:

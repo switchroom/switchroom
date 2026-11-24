@@ -135,13 +135,17 @@ def capture_context(*, track: bool = False, board: Any = None) -> NativeContext:
         from hermes_constants import get_hermes_home
         from agent.delegation_context import is_delegated_child_process_context, explicit_board_intent_is_pinned
         bound = {var.name: value for var, value in contextvars.copy_context().items()
-                 if var.name.startswith('HERMES_SESSION_') or var.name == 'HERMES_UI_SESSION_ID'}
+                 if var.name.startswith('HERMES_SESSION_') or var.name in ('HERMES_UI_SESSION_ID', 'HERMES_CRON_SESSION')}
         key = bound_session_key()
         def read(name):
             value = bound.get(name)
             if not isinstance(value, str):
                 raise Unavailable('The native host did not bind session context for this tool call')
             return value
+        if not key:
+            cron = _scheduled_run(bound)
+            if cron is not None:
+                return _cron_context(cron, read)
         if not key or key != read('HERMES_SESSION_KEY'):
             raise Unavailable('Linear needs a native host-bound session; model identity is not accepted')
         fields = {name: read('HERMES_SESSION_' + name.removeprefix('session_').upper()) for name in
@@ -166,6 +170,56 @@ def capture_context(*, track: bool = False, board: Any = None) -> NativeContext:
         return NativeContext.from_wire({'home': str(home), 'profile': profile, **fields}, home, profile)
     except (ImportError, OSError) as exc:
         raise Unavailable('This Hermes host cannot provide native session/profile context') from exc
+
+
+# A scheduled run binds no session key (upstream keeps cron output out of user chats). Its
+# identity is the scheduler's own: the HERMES_CRON_SESSION ContextVar it binds per run plus
+# the cron execution it entered after winning that run. Neither is reachable from model
+# arguments, tool subprocesses or os.environ, and delegated children read no execution.
+CRON_PLATFORM = 'cron'
+# Content-only actions a scheduled run may take as this profile's own app. Starting,
+# owning, routing or handing over work needs a person's chat; see chat.cron_refusal.
+CRON_ACTIONS = frozenset({'status', 'create_issue', 'add_comment', 'update_description', 'link_issue'})
+
+
+def _scheduled_run(bound: dict) -> Any:
+    """The cron execution this context runs inside, or None. Env-only markers never count."""
+    if bound.get('HERMES_CRON_SESSION') != '1':
+        return None
+    try:
+        from cron.execution_identity import current_cron_execution
+    except ImportError:
+        return None  # a Core without the scheduler identity keeps refusing cron writes
+    from agent.delegation_context import is_delegated_child_process_context
+    run = current_cron_execution()
+    if run is None or is_delegated_child_process_context():
+        return None
+    if not all(isinstance(getattr(run, name, None), str) and getattr(run, name)
+               for name in ('job_id', 'execution_id', 'profile')):
+        return None
+    return run
+
+
+def _cron_context(run: Any, read: Callable[[str], str]) -> NativeContext:
+    """This profile's own scheduled-run identity; the job and execution are its provenance."""
+    from hermes_constants import get_hermes_home
+    home = Path(get_hermes_home()).resolve(strict=True)
+    bound_profile = read('HERMES_SESSION_PROFILE')
+    if bound_profile and bound_profile != run.profile:
+        raise Unavailable('The scheduled run belongs to another profile')
+    profile = _native_profile(run.profile, home)
+    key = f'cron:{run.job_id}:{run.execution_id}'
+    return NativeContext.from_wire({
+        'home': str(home), 'profile': profile, 'platform': CRON_PLATFORM, 'source': CRON_PLATFORM,
+        'session_key': key, 'session_id': run.execution_id, 'message_id': '', 'user_id': '',
+        'user_id_alt': '', 'chat_id': '', 'chat_type': '', 'thread_id': '', 'scope_id': '',
+        'ui_session_id': '', 'delegated_child': False, 'native_board': '', 'native_db_path': '',
+        'pinned_board': '', 'pinned_db_path': ''}, home, profile)
+
+
+def is_cron(context: Any) -> bool:
+    return getattr(context, 'platform', None) == CRON_PLATFORM or str(
+        getattr(context, 'session_key', '') or '').startswith('cron:')
 
 class Unavailable(RuntimeError):
     pass
