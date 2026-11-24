@@ -8,10 +8,13 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import ipaddress
 import json
 import logging
+import math
 import os
 import re
 import secrets
+import selectors
 import socket
+import socketserver
 import ssl
 import sys
 import threading
@@ -78,6 +81,21 @@ def _rejection_kind(response, body):
     elif value.get('reason') == 'bad_json' and isinstance(error, str) and _GO_BAD_JSON.match(error):
         return 'invalid_json_at_origin'
     return None
+
+
+def rejected_window_reset(response):
+    """Epoch seconds a used-up plan window reopens, from the 429 that rejected it; None for any other answer.
+
+    Every answer carries the window's reset, so only a rejected window makes it this 429's reset: a throttle
+    while the window is open must not bench the route for hours.
+    """
+    if response.status != 429 or (response.getheader('anthropic-ratelimit-unified-status') or '').strip() != 'rejected':
+        return None
+    try:
+        reset = float(response.getheader('anthropic-ratelimit-unified-reset') or '')
+    except ValueError:
+        return None
+    return round(reset) if math.isfinite(reset) and reset > 0 else None
 
 
 class UpstreamIdle(OSError):
@@ -162,10 +180,11 @@ def _frame_first(messages, queried):
     return True
 
 
-# The only trailing system text the relay moves: native 2.1.299's date line, exactly as its opening request ends the
-# environment message. Any other trailing text stays put, since moving text that varies per request into the
-# environment message would change the prefix from message 1 on every request.
-_DATE_LINE = re.compile(r"Today's date is \d{4}-\d{2}-\d{2}\.")
+# The only trailing system text the relay moves: native's date line, exactly as its opening request ends the
+# environment message (bare on 2.1.299, wrapped in a system-reminder on 2.1.292 and 2.1.319). Any other trailing
+# text stays put, since moving text that varies per request into the environment message would change the prefix
+# from message 1 on every request.
+_DATE_LINE = re.compile(r"(?:<system-reminder>\n)?Today's date is \d{4}-\d{2}-\d{2}\.(?:\n</system-reminder>)?")
 
 
 def stable_request_context(payload, queried):
@@ -552,6 +571,8 @@ class Capture:
         self.decoder = codecs.getincrementaldecoder('utf-8')()
         self.arguments = {}
         self.unparsed = []
+        # (id, native name, raw arguments) of each call whose streamed arguments did not parse.
+        self.unparsed_calls = []
 
     def feed(self, chunk):
         self.pending += self.decoder.decode(chunk)
@@ -599,10 +620,12 @@ class Capture:
             try:
                 self.message['content'][index]['input'] = json.loads(raw) if raw.strip() else {}
             except ValueError:
-                # Streamed tool input is not validated (``eager_input_streaming``): a reply cut off at
-                # max_tokens ends mid-argument. The call is dropped at message_stop, never run with guessed
-                # arguments, and the stop reason (finish ``length``) tells Hermes the reply was cut short.
+                # Streamed tool input is not validated (``eager_input_streaming``): a reply cut at max_tokens ends
+                # mid-argument, and the API can stream invalid JSON. Dropped from native's turn at message_stop; the
+                # client hands it to Hermes with finish ``length``, so it is never run.
+                block = self.message['content'][index]
                 self.unparsed.append(index)
+                self.unparsed_calls.append((block.get('id'), block.get('name'), raw))
 
     def _delta(self, event):
         self.message.update(event.get('delta', {}))
@@ -669,9 +692,18 @@ class _Server(HTTPServer):
             return
         super().handle_error(request, client_address)
 
+    def server_bind(self):
+        # HTTPServer.server_bind also asks DNS for the bound address's name (socket.getfqdn) only to fill
+        # server_name, which nothing here reads. Every call starts a relay, and on a host whose resolver stalls on
+        # 127.0.0.1 the first call of each process waited out that lookup (35 s on one macOS host).
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[0], self.server_address[1]
+
 
 class Admission:
-    def __init__(self, upstream, timeout, queried=None):
+    def __init__(self, upstream, timeout, queried=None, *, proxy=None, context=None):
+        """``proxy`` (``(host, port, tunnel_headers)``) replaces the proxy-variable lookup and ``context`` the
+        default TLS context; both come from the plugin's upstream settings (``directsdk_setup.resolve_upstream``)."""
         self.upstream = urlsplit(upstream)
         self.queried = queried
         host = self.upstream.hostname
@@ -682,15 +714,19 @@ class Admission:
         if (self.upstream.scheme != 'https' and not (self.upstream.scheme == 'http' and local)) or not host or self.upstream.username or self.upstream.password or self.upstream.query or self.upstream.fragment:
             raise ValueError('Native upstream must be HTTPS or a loopback HTTP fixture')
         self.timeout = timeout
-        self.proxy = upstream_proxy(self.upstream)
+        self.proxy = proxy if proxy is not None else upstream_proxy(self.upstream)
+        self.context = context
         self.lock = threading.Lock()
         self.sockets = set()
         self.cancelled = False
         self.used = False
         self.denied = 0
+        # Ask the API to stream tool arguments; off for a conversation whose streamed arguments came back invalid.
+        self.eager = True
         self.auth_retry_used = False
         self.request_id = None
         self.status = None
+        self.reset_at = None
         self.failure = None
         self.unrestored = None
         self.capture = Capture()
@@ -698,9 +734,36 @@ class Admission:
         self.prefix = '/admit/' + secrets.token_urlsafe(32)
         self.server = _Server(('127.0.0.1', 0), Handler)
         self.server.admission = self
+        # _serve() calls handle_request() once the listener is readable; it selects again before accepting, and must
+        # not wait there: a connection gone in between would hold the loop, and close() with it.
+        self.server.timeout = 0
         self.url = f'http://127.0.0.1:{self.server.server_port}' + self.prefix
-        self.thread = threading.Thread(target=self.server.serve_forever, kwargs={'poll_interval':.05}, daemon=True)
-        self.thread.start()
+        # close() wakes the loop through this pair at once; serve_forever() noticed a shutdown only at its next poll,
+        # up to 50 ms after close() asked, on every step.
+        selector = None
+        try:
+            self._wake, self._waker = socket.socketpair()
+            # Made here, not in the thread: an epoll that cannot be had (out of descriptors) fails the relay's start.
+            selector = selectors.DefaultSelector()
+            selector.register(self.server, selectors.EVENT_READ)
+            selector.register(self._wake, selectors.EVENT_READ)
+            self.thread = threading.Thread(target=self._serve, args=(selector,), daemon=True)
+            self.thread.start()
+        except BaseException:
+            # Out of descriptors or threads: the listener must not outlive the relay that could not start.
+            self.server.server_close()
+            for each in (selector, getattr(self, '_wake', None), getattr(self, '_waker', None)):
+                if each is not None:
+                    each.close()
+            raise
+
+    def _serve(self, selector):
+        with selector:
+            while True:
+                ready = [key.fileobj for key, _ in selector.select()]
+                if self._wake in ready:
+                    return
+                self.server.handle_request()
 
     def error_text(self):
         """The upstream's own message for a non-200 answer, '' when none was captured."""
@@ -730,9 +793,14 @@ class Admission:
 
     def close(self):
         self.abort()
-        self.server.shutdown()
+        try:
+            self._waker.send(b'\0')
+        except OSError:
+            pass  # Already closed: a second close().
         self.thread.join()
         self.server.server_close()
+        self._wake.close()
+        self._waker.close()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -766,10 +834,10 @@ class Handler(BaseHTTPRequestHandler):
         if target.scheme == 'https':
             if gate.proxy:
                 proxy_host, proxy_port, tunnel_headers = gate.proxy
-                conn = http.client.HTTPSConnection(proxy_host, proxy_port, timeout=gate.timeout, context=ssl.create_default_context())
+                conn = http.client.HTTPSConnection(proxy_host, proxy_port, timeout=gate.timeout, context=gate.context or ssl.create_default_context())
                 conn.set_tunnel(target.hostname, target.port or 443, headers=tunnel_headers)
             else:
-                conn = http.client.HTTPSConnection(target.hostname, target.port, timeout=gate.timeout, context=ssl.create_default_context())
+                conn = http.client.HTTPSConnection(target.hostname, target.port, timeout=gate.timeout, context=gate.context or ssl.create_default_context())
         else:
             conn = http.client.HTTPConnection(target.hostname, target.port, timeout=gate.timeout)
         try:
@@ -843,7 +911,8 @@ class Handler(BaseHTTPRequestHandler):
                 gate.unrestored = str(exc)
             payload = stable_request_context(payload, gate.queried)
             payload = pin_message_breakpoint(payload, gate.queried)
-            payload = stream_tool_input(payload)
+            if gate.eager:
+                payload = stream_tool_input(payload)
             target = gate.upstream
             conn, upstream_socket = self._connect_upstream()
             if conn is None:
@@ -887,6 +956,7 @@ class Handler(BaseHTTPRequestHandler):
             del headers, payload, wire
             gate.request_id = response.getheader('request-id') or response.getheader('x-request-id')
             gate.status = response.status
+            gate.reset_at = rejected_window_reset(response)
             self.send_response(response.status)
             for key, value in response.getheaders():
                 if key.lower() not in ('connection','transfer-encoding','server','date'):
