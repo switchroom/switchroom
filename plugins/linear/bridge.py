@@ -4169,9 +4169,10 @@ class Bridge:
         A CI gate (HF-800) is satisfied once CI on its head has finished or its window has passed.
         The verdict is written as a native task comment first and the unblock is guarded on that
         comment being the only new event since the block, so the resumed worker reads the verdict and a
-        Stop that lands in between still wins. A second park on the same task trips core's
-        block-loop breaker into triage; that ``block_loop_detected`` carries the same wait and
-        resumes the same way, up to ``waits.CI_MAX_PARKS`` CI parks per task.
+        Stop that lands in between still wins. A claimed park (``waits.claim_wait``) is not counted
+        by core's block-loop breaker; on a Core without that hook a second park trips it into triage,
+        and that ``block_loop_detected`` carries the same wait and resumes the same way. Either
+        way, up to ``waits.CI_MAX_PARKS`` CI parks per task.
 
         A park on a task no Linear issue is bound to is resumed the same way by
         ``pump_unbound_waits`` (HF-827); only the report to Linear differs.

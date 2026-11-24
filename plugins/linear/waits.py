@@ -34,10 +34,19 @@ the window (default 3 h, at most 24 h) has passed since the park, then writes th
 verdict as a task comment and resumes the same task once. The verdict covers every
 run on that head, a superset of the required checks; merging still binds the
 required checks to the reviewed head.
+
+Where Core has the ``kanban_wait_claim`` hook (HF-850) the plugin claims each such wait
+before Core writes it (``claim_wait``): Core marks it ``source: external_wait``, a board
+hold, so nobody is pinged or woken and the block-loop breaker does not count it. A wait
+naming nothing checkable, a CI park past ``CI_MAX_PARKS``, a task of another profile and
+any wait under a specialist scope are not claimed and alert as before.
 """
 from __future__ import annotations
 
+import json
 import re
+import sqlite3
+from contextlib import closing
 from pathlib import Path
 from typing import Any, Callable
 
@@ -58,6 +67,7 @@ CI_MAX_PARKS = 20  # CI parks one task may resume by itself; past that a person 
 # Conclusions that do not fail CI. Anything else (failure, cancelled, timed_out, action_required,
 # startup_failure, stale, an unknown value) is a failed verdict the worker must look at.
 CI_PASSING = frozenset({"success", "skipped", "neutral"})
+WAIT_CLAIM_HOOK = "kanban_wait_claim"
 
 
 def parse(payload: dict[str, Any]) -> dict[str, list] | None:
@@ -76,6 +86,52 @@ def parse(payload: dict[str, Any]) -> dict[str, list] | None:
     issues = list(dict.fromkeys(ISSUE_KEY.findall(text)))
     gates = [(path, needle) for path, needle in gates if needle]
     return {"issues": issues, "gates": gates, "ci": ci} if issues or gates or ci else None
+
+
+def resumable(reason: str, earlier: list[dict[str, Any]]) -> bool:
+    """Whether the bridge resumes a parentless dependency wait with this ``reason`` by itself (HF-850).
+
+    Core asks (``kanban_wait_claim``) before it writes the block; a claimed wait is quiet board
+    state: no "needs attention" ping, no wake, no block-loop count. ``earlier`` are the payloads of
+    the task's earlier ``blocked`` / ``block_loop_detected`` events. A wait naming nothing the bridge
+    checks, or a CI park past ``CI_MAX_PARKS`` (the bridge leaves that one for a person), is not
+    claimed and alerts as before.
+    """
+    wait = parse({"requested_kind": "dependency", "rekind_reason": "no_open_parent", "reason": reason})
+    if wait is None:
+        return False
+    return not wait["ci"] or 1 + sum(1 for payload in earlier if (parse(payload) or {}).get("ci")) <= CI_MAX_PARKS
+
+
+def register_wait_claim(ctx: Any) -> None:
+    """Answer Core's ``kanban_wait_claim`` when Core has it; an older Core reports every wait as before.
+
+    Not under a specialist scope: there the bridge may decline to read other issues or to resume.
+    """
+    try:
+        from hermes_cli.plugins import VALID_HOOKS
+    except ImportError:
+        return
+    if WAIT_CLAIM_HOOK in VALID_HOOKS and not ctx.get_config("specialist_scope"):
+        ctx.register_hook(WAIT_CLAIM_HOOK, claim_wait)
+
+
+def claim_wait(*, task_id: str, board: str, reason: str, profile_name: str, **_: Any) -> dict[str, bool] | None:
+    """``{"resumes": True}`` for a wait on this profile's own task the bridge resumes (``resumable``).
+
+    Called in the worker before Core writes the block; one read-only look at the task's earlier blocks.
+    """
+    from hermes_cli import kanban_db
+
+    path = Path(kanban_db.kanban_db_path(board=board))
+    with closing(sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=5)) as conn:
+        task = conn.execute("SELECT assignee FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        rows = conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind IN "
+                            "('blocked', 'block_loop_detected')", (task_id,)).fetchall()
+    if task is None or task[0] != profile_name or not isinstance(reason, str):
+        return None
+    earlier = [payload for payload in (json.loads(row[0]) if row[0] else None for row in rows) if isinstance(payload, dict)]
+    return {"resumes": True} if resumable(reason, earlier) else None
 
 
 def _ci_gate(match: re.Match) -> dict[str, Any] | None:
