@@ -144,7 +144,8 @@ class PluginTests(unittest.TestCase):
         ctx = Ctx()
         self.plugin.register(ctx)
         # No tool_execution middleware on this stand-in core: the password scrub falls back to the hook.
-        self.assertEqual(set(ctx.hooks), {"pre_tool_call", "pre_llm_call", "transform_tool_result"})
+        self.assertEqual(set(ctx.hooks), {"pre_tool_call", "pre_llm_call", "on_session_end", "on_session_finalize",
+                                          "transform_tool_result"})
         (section_id, text, position), = ctx.sections
         self.assertEqual(section_id, "camoufox-desktop.browsers")
         self.assertEqual(position, "after_memory")

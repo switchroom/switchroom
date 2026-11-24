@@ -17,7 +17,12 @@ the desktop. This plugin adds, without patching either:
   and the engine for CDP-only work;
 * a dock icon that opens or raises the agent's own Camoufox session;
 * password fields: what the page-reading camofox tools return to the model never carries a password
-  field's value, whoever typed it (``password_scrub``; the snapshot prints every input's value).
+  field's value, whoever typed it (``password_scrub``; the snapshot prints every input's value);
+* tabs (``tabs``): the browser tools follow a popup an action opens and, after a hand-back, the tab
+  the human left in front; ``browser_tabs`` lists, switches and closes the agent's own tabs; the tabs
+  stay alive while a human holds the screen and the session's untracked tabs close when it ends; an
+  empty first snapshot after navigate is re-read until the page renders; a screen handoff names the
+  browser and the live tab and brings that Camoufox tab to front.
 
 It also points the camofox plugin at the local service: the access key (shared with the service via
 ``<HERMES_HOME>/camofox-browser/access-key``) and, when the profile sets no identity, one fixed
@@ -35,17 +40,18 @@ import urllib.error
 from pathlib import Path
 from typing import Any, Optional
 
-from . import camoufox_local, dock, password_scrub
+from . import camoufox_local, dock, password_scrub, tabs
 
 logger = logging.getLogger(__name__)
 
 CAMOFOX_TOOLSET = "camofox"
-# Fallback when the registry cannot say (the camofox plugin's tool names).
+# Fallback when the registry cannot say (the camofox plugin's tool names, and browser_tabs).
 CAMOFOX_TOOLS = frozenset({
     "browser_navigate", "browser_snapshot", "browser_click", "browser_type", "browser_scroll",
     "browser_back", "browser_press", "browser_get_images", "browser_vision", "browser_console",
-    "browser_import_cookies",
+    "browser_import_cookies", "browser_tabs",
 })
+CHROMIUM_TOOLS = frozenset({"browser_exec", "browser_dialog"})
 VAULT_WRITES = frozenset({"fill", "save_login", "enter_code"})
 
 STEERING = (
@@ -57,7 +63,12 @@ STEERING = (
     "browser_dialog), for a Google sign-in, for a flow a skill pins to browser_exec, or when Camoufox "
     "fails. The two browsers do not share logins.\n"
     "- A CAPTCHA or human-verification challenge is for the human: use screen_handoff, never solve it.\n"
-    "- When a human holds the screen (Take over), browser tools refuse; end your turn and wait."
+    "- When a human holds the screen (Take over), browser tools refuse; end your turn and wait.\n"
+    "- Tabs: when a Camoufox click, key press or script opens a popup or new tab, the browser tools move "
+    "to it and the result says popup_opened; snapshot before acting. browser_tabs lists, switches and "
+    "closes your own Camoufox tabs; close the orphans you opened. In browser_exec, after a click that may "
+    "open a tab or popup, call list_tabs() and switch_tab() to the new one, and close_tab() the orphans "
+    "you opened."
 )
 HANDBACK_NOTE = ("Bot Screen: the human handed control back; you hold the screen again. Re-snapshot "
                  "the page before acting, because it may have changed.")
@@ -65,6 +76,10 @@ HANDBACK_NOTE = ("Bot Screen: the human handed control back; you hold the screen
 _lock = threading.Lock()
 # session_id -> lease epoch at the moment the session started waiting for the human.
 _waiting: dict[str, int] = {}
+# session_id -> the task_id its tool calls carry (the camofox plugin keys its tab by task_id).
+_task_of: dict[str, str] = {}
+# task_id -> the Bot Desktop lease epoch at its last camofox call (a change means a Take over).
+_seen_epoch: dict[str, int] = {}
 _dock_state = {"done": False}
 
 
@@ -143,8 +158,11 @@ def _maybe_dock(published: Optional[dict[str, str]] = None) -> None:
     logger.info("camoufox-desktop: dock icon %s", result)
 
 
-def pre_tool_call(tool_name: str = "", args: Any = None, session_id: str = "", **_: Any):
+def pre_tool_call(tool_name: str = "", args: Any = None, session_id: str = "", task_id: str = "", **_: Any):
     try:
+        if session_id and task_id:
+            with _lock:
+                _task_of[session_id] = task_id
         if tool_name == "screen_handoff" and isinstance(args, dict) and args.get("action") == "link":
             _mark_waiting(session_id)
             return None
@@ -342,35 +360,160 @@ def pre_llm_call(session_id: str = "", **_: Any):
         return None  # the human still holds it, or nothing has changed yet
     with _lock:
         _waiting.pop(session_id, None)
+        task_id = _task_of.get(session_id, session_id)
+    note = HANDBACK_NOTE
     if (os.environ.get("CAMOFOX_URL") or "").strip():
         _checkpoint_async()
-    return {"context": HANDBACK_NOTE}
+        adopted = tabs.adopt_focused_tab(task_id)
+        with _lock:
+            _seen_epoch[task_id or "default"] = now.epoch  # told here; the next tool call need not re-adopt
+        if adopted:
+            note += f" The browser tools are now on {adopted['url'] or 'the tab the human left open'}."
+            if adopted["switched"]:
+                note += (" That is the tab the human left in front, not the one you were on; element refs from "
+                         "earlier snapshots no longer apply.")
+    return {"context": note}
+
+
+def _camofox_live() -> bool:
+    return bool((os.environ.get("CAMOFOX_URL") or "").strip())
 
 
 def _scrubs(tool_name: str) -> bool:
-    return (tool_name in password_scrub.PAGE_READ_TOOLS and _is_camofox_tool(tool_name)
-            and bool((os.environ.get("CAMOFOX_URL") or "").strip()))
+    return tool_name in password_scrub.PAGE_READ_TOOLS and _is_camofox_tool(tool_name) and _camofox_live()
 
 
-def _scan() -> password_scrub.Scan:
+def _scan(task_id: Optional[str] = None, extra_tabs: tuple[str, ...] = ()) -> password_scrub.Scan:
+    """Scan only the tab(s) the output came from; with no tracked tab, every tab (fail safe)."""
+    session = tabs.tracked_session(task_id) if task_id is not None else None
+    if session is not None and session.get("tab_id"):
+        user = session["user_id"]
+        pairs = [(user, t) for t in (session["tab_id"], *extra_tabs) if t]
+        return password_scrub.scan([user], targets=pairs)
     return password_scrub.scan([user_id()])
 
 
-def scrub_passwords(tool_name: str = "", next_call: Any = None, **_: Any) -> Any:
-    """``tool_execution`` middleware: run the tool, then take password-field values out of its output.
-    Middleware wraps the dispatch itself, so unlike a ``transform_tool_result`` hook it has no
-    callback timeout to fail open on and no other plugin's result can win over it."""
-    result = next_call()  # a tool failure propagates unchanged
+def browser_middleware(tool_name: str = "", args: Any = None, next_call: Any = None, task_id: str = "",
+                       **_: Any) -> Any:
+    """``tool_execution`` middleware around every tool: popup follow and the empty-snapshot wait for
+    the camofox tools, handoff naming for ``screen_handoff``, then the password scrub. Middleware wraps
+    the dispatch itself, so unlike a ``transform_tool_result`` hook it has no callback timeout to fail
+    open on and no other plugin's result can win over it. A tool failure propagates unchanged."""
+    if tool_name == "screen_handoff":
+        return _handoff(args, next_call, task_id)
+    if tool_name in CHROMIUM_TOOLS:
+        tabs.note_browser(task_id, "chromium")
+        return next_call()
+    if not (_is_camofox_tool(tool_name) and _camofox_live()):
+        return next_call()
+    tabs.note_browser(task_id, "camoufox")
+    refused = _follow_takeover(tool_name, task_id)
+    if refused is not None:
+        return refused
+    before = tabs.before_action(tool_name, task_id)
+    result = next_call()
+    result = tabs.after_action(tool_name, task_id, before, result)
+    if tool_name == "browser_navigate":
+        result = tabs.settle_snapshot(task_id, result)
+    tabs.remember(task_id)
     if not _scrubs(tool_name):
         return result
-    return password_scrub.scrub_tool_output(tool_name, result, _scan)
+    opener = (before or {}).get("tab_id")
+    return password_scrub.scrub_tool_output(tool_name, result, lambda: _scan(task_id, (opener,) if opener else ()))
 
 
-def transform_tool_result(tool_name: str = "", result: Any = None, **_: Any) -> Optional[str]:
-    """Fallback for a core without ``tool_execution`` middleware."""
+# The name the password scrub was registered under before HF-826 (the live smoke test calls it).
+scrub_passwords = browser_middleware
+
+# Tools that may run on a tab the session just moved to: they read, or replace the page anyway.
+_SAFE_AFTER_TAB_CHANGE = frozenset({"browser_snapshot", "browser_vision", "browser_get_images", "browser_navigate",
+                                    "browser_tabs"})
+
+
+def _lease_epoch() -> Optional[int]:
+    try:
+        from tools.bot_desktop import lease
+        return int(lease.get().epoch)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _follow_takeover(tool_name: str, task_id: str) -> Optional[str]:
+    """A Take over happened since this task's last camofox call (the lease epoch moved) and nobody told
+    it at hand-back (it was not waiting): adopt the tab the human left in front now. An input action
+    whose ref came from the old tab is refused once, with the new URL, instead of landing elsewhere."""
+    epoch = _lease_epoch()
+    if epoch is None:
+        return None
+    with _lock:
+        last = _seen_epoch.get(task_id or "default")
+        _seen_epoch[task_id or "default"] = epoch
+    if last is None or last == epoch:
+        return None
+    adopted = tabs.adopt_focused_tab(task_id)
+    if not adopted or not adopted["switched"] or tool_name in _SAFE_AFTER_TAB_CHANGE:
+        return None
+    return json.dumps({"success": False, "code": "tab_changed_after_takeover",
+                       "error": (f"While a human held the screen the page in front changed; the browser tools are "
+                                 f"now on {adopted['url'] or 'the tab they left open'}. Call browser_snapshot, "
+                                 f"then retry with refs from it.")})
+
+
+def _handoff(args: Any, next_call: Any, task_id: str) -> Any:
+    if not (isinstance(args, dict) and args.get("action") == "link"):
+        return next_call()
+    try:
+        view = tabs.handoff_view(task_id)
+    except Exception as exc:  # noqa: BLE001 - naming is a bonus; the handoff itself must happen
+        logger.info("camoufox-desktop: handoff naming skipped: %s", exc)
+        view = None
+    if not view:
+        return next_call()
+    result = next_call({**args, "reason": tabs.handoff_reason(str(args.get("reason") or ""), view)})
+    try:
+        data = json.loads(result) if isinstance(result, str) else None
+        if isinstance(data, dict):
+            data["browser"] = view["browser"]
+            if view.get("url"):
+                data["tab_url"] = view["url"]
+            return json.dumps(data)
+    except ValueError:
+        pass
+    return result
+
+
+def browser_tabs_tool(args: dict, **kw: Any) -> str:
+    def scrub(text: str, pairs: list[tuple[str, str]]) -> str:
+        users = list(dict.fromkeys(u for u, _ in pairs)) or [user_id()]
+        return password_scrub.scrub_tool_output("browser_tabs", text,
+                                                lambda: password_scrub.scan(users, targets=pairs))
+    return tabs.browser_tabs(args, kw.get("task_id"), scrub)
+
+
+def on_session_end(session_id: str = "", task_id: str = "", **_: Any) -> None:
+    """End of a turn: close agent popups the session no longer uses (not while it waits for a human)."""
+    if not _camofox_live():
+        return
+    with _lock:
+        waiting = bool(session_id) and session_id in _waiting
+        task = task_id or _task_of.get(session_id, session_id)
+    if not waiting and task:
+        tabs.close_agent_popups(task)
+
+
+def on_session_finalize(session_id: str = "", **_: Any) -> None:
+    if not session_id or not _camofox_live():
+        return
+    with _lock:
+        task_id = _task_of.pop(session_id, session_id)
+    tabs.close_untracked(task_id)
+
+
+def transform_tool_result(tool_name: str = "", result: Any = None, task_id: str = "", **_: Any) -> Optional[str]:
+    """Fallback for a core without ``tool_execution`` middleware (password scrub only)."""
     if not _scrubs(tool_name):
         return None
-    cleaned = password_scrub.scrub_tool_output(tool_name, result, _scan)
+    cleaned = password_scrub.scrub_tool_output(tool_name, result, lambda: _scan(task_id or None))
     return cleaned if isinstance(cleaned, str) else json.dumps(cleaned, ensure_ascii=False, default=str)
 
 
@@ -388,10 +531,16 @@ def register(ctx) -> None:
     configure_environment()
     ctx.register_hook("pre_tool_call", pre_tool_call)
     ctx.register_hook("pre_llm_call", pre_llm_call)
+    ctx.register_hook("on_session_end", on_session_end)
+    ctx.register_hook("on_session_finalize", on_session_finalize)
     if _middleware_supported(ctx):
-        ctx.register_middleware("tool_execution", scrub_passwords)
+        ctx.register_middleware("tool_execution", browser_middleware)
     else:
         ctx.register_hook("transform_tool_result", transform_tool_result)
+    if hasattr(ctx, "register_tool"):
+        ctx.register_tool(name=tabs.BROWSER_TABS_SCHEMA["name"], toolset=CAMOFOX_TOOLSET,
+                          schema=tabs.BROWSER_TABS_SCHEMA, handler=browser_tabs_tool, check_fn=_camofox_live,
+                          description=tabs.BROWSER_TABS_SCHEMA["description"], emoji="🗂️")
     if hasattr(ctx, "register_system_prompt_section"):
         try:
             ctx.register_system_prompt_section("camoufox-desktop.browsers", STEERING, position="after_memory")
@@ -401,7 +550,8 @@ def register(ctx) -> None:
         if not _published_env().get("DISPLAY"):
             _maybe_dock(None)  # screen stopped: a direct, cache-free panel edit is safe now
         _start_checkpointer(_hermes_home())
+        tabs.start_keepalive()
 
 
-__all__ = ["register", "pre_tool_call", "pre_llm_call", "configure_environment", "user_id", "scrub_passwords",
-           "transform_tool_result"]
+__all__ = ["register", "pre_tool_call", "pre_llm_call", "configure_environment", "user_id", "browser_middleware",
+           "scrub_passwords", "browser_tabs_tool", "on_session_end", "on_session_finalize", "transform_tool_result"]
