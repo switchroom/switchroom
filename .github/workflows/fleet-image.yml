@@ -1185,7 +1185,7 @@ jobs:
   promote:
     # HF-851 content-identity promotion: publish the exact digest the merged PR built, runtime-checked,
     # smoke-tested and scanned, instead of rebuilding it. Its revision label is the PR head and its
-    # ai.switchroom.tree label is this main commit's tree (identical by construction: main requires
+    # hermes-fleet.source-tree label is this main commit's tree (identical by construction: main requires
     # PRs to be up to date and squash-merges them). Before the first registry write this job binds
     # the registry config to that identity, re-runs the CRITICAL Trivy scan against today's database,
     # re-checks VEX and waits for green exact-main CI; then it tags, attests and hands off the digest.

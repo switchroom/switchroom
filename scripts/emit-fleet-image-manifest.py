@@ -38,7 +38,7 @@ def main() -> int:
     parser.add_argument("--revision", required=True)
     parser.add_argument("--digest", required=True)
     parser.add_argument("--agent-manifest", type=Path, required=True)
-    # HF-851 content identity: the source tree (image label ai.switchroom.tree) and, for a promoted
+    # HF-851 content identity: the source tree (image label hermes-fleet.source-tree) and, for a promoted
     # PR image, the tree-identical commit its revision label names. `revision` stays the main commit.
     parser.add_argument("--tree", default="")
     parser.add_argument("--image-revision", default="")

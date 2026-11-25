@@ -5,7 +5,7 @@
 ``preflight_bake`` built and scanned is the tree main publishes. Since HF-851 the
 image is stamped with content identity, not with the main commit: the PR bake
 stamps its head commit (``FLEET_GIT_SHA``, OCI revision label) and the git tree
-(``FLEET_SOURCE_TREE``, ``ai.switchroom.tree``), and the squash-merged main commit
+(``FLEET_SOURCE_TREE``, ``hermes-fleet.source-tree``), and the squash-merged main commit
 has exactly that tree. Main therefore promotes the exact scanned digest (retag,
 fresh Trivy/VEX gate, exact-main CI gate, attestations) instead of rebuilding it.
 The PR leaves behind what main needs:
@@ -74,7 +74,7 @@ WORKFLOW_PATH = ".github/workflows/fleet-image.yml"
 MAX_AGE = dt.timedelta(hours=72)
 PRUNE_AGE = dt.timedelta(days=7)
 STAGE_TAG_RE = re.compile(r"^fleet-pr-stage-[0-9]+-[0-9]+$")
-TREE_LABEL = "ai.switchroom.tree"
+TREE_LABEL = "hermes-fleet.source-tree"
 REVISION_LABEL = "org.opencontainers.image.revision"
 SOURCE_LABEL = "org.opencontainers.image.source"
 BASE_LABEL = "org.opencontainers.image.base.name"
