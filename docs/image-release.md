@@ -82,7 +82,7 @@ Agent source and checks context resolution, aliases and override precedence.
 
 The native deny list keeps every previously denied name, including
 `AppifactRepl`, `FetchInboxMessage`, and `SubagentHandback`, which remain in
-the reviewed executable. It also denies new native tools from 2.1.296 and the 2.1.316 additions `SubscribePR`, `SendToProject` and `SendToProjectContext`, and the 2.1.319 additions `ReadWidgetContext`, `WrapUp` and `CrossSessionMessage` (2.1.323 adds no native tool names; its Read tool only gains `image_attached`/`page` output fields), and the 2.1.326 executable constants `PlaceHookTranscript`, `ReadSessionRepo` and `RunModFs` (denied defensively; 2.1.326 otherwise only reshapes the already-denied `ProposeSkills` input), including
+the reviewed executable. It also denies new native tools from 2.1.296 and the 2.1.316 additions `SubscribePR`, `SendToProject` and `SendToProjectContext`, and the 2.1.319 additions `ReadWidgetContext`, `WrapUp` and `CrossSessionMessage` (2.1.323 adds no native tool names; its Read tool only gains `image_attached`/`page` output fields), and the 2.1.325 executable constants `PlaceHookTranscript`, `ReadSessionRepo` and `RunModFs` (denied defensively; 2.1.325 otherwise only reshapes the already-denied `ProposeSkills` input), and the 2.1.326 additions `GetGoal`, `SetGoal`, `PauseGoal`, `RunModFsRange` and `WorkspaceDiffForRemote` (session goal tools and session-host constants, denied not approved; 2.1.326 otherwise only changes field docs of existing tools), including
 `OfferChromeSetup`, `ListConnectors`, `PublishPlugin`, `PowerShell`, and
 `WaitForMcpServers`. Those tools are denied, not approved. `ToolSearch` stays
 available only to discover profile-authorized connectors. Review actual
