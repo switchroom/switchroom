@@ -40,6 +40,11 @@ jobs:
           permission-contents: write
           permission-pull-requests: write
           permission-workflows: write
+          # Read-only scopes so GitHub can evaluate the required checks when it runs the armed auto-merge as this
+          # token's App identity (without them the first armed merge was disarmed: "Branch protection rule check failed").
+          permission-checks: read
+          permission-statuses: read
+          permission-actions: read
 
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -92,7 +97,10 @@ jobs:
           git add -A
           git commit -q -m "Bump bundled CLIs: ${summary}" -m "Automated by .github/workflows/cli-bump.yml (HF-851)."
           git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git"
-          git push --force-with-lease origin "$branch"
+          # The checkout fetched main only, so a bare --force-with-lease has no tracking ref for an existing bot branch
+          # and is rejected as "stale info". Lease on the remote branch as it is now (empty when it does not exist yet).
+          remote_head="$(git ls-remote origin "refs/heads/$branch" | cut -f1)"
+          git push --force-with-lease="refs/heads/$branch:${remote_head}" origin "$branch"
           label=needs-native-tool-review
           [ "$GROUP" = auto ] && label=cli-bump-auto
           gh label create "$label" -R "$REPO" --color BFD4F2 --description "CLI bump bot" 2>/dev/null || true
