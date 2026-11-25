@@ -231,8 +231,8 @@ RUN test ! -e /opt/hermes/plugins/web/perplexity
 # a CLI-only change (package.json/package-lock.json, the version ARGs) rebuilds just this layer and
 # the cheap provenance tail, while the apt desktop/Chromium, Camoufox, camofox-browser and Honcho
 # layers above stay in the BuildKit/registry cache. Layer order: base OS (Agent parent) -> pinned
-# desktop/browser runtimes -> Honcho -> pinned CLIs -> provenance stamp (HF-851). On main the
-# scanned PR image is promoted, not rebuilt, so this order mainly speeds up the PR bake.
+# desktop/browser runtimes -> Honcho -> pinned CLIs -> provenance stamp (HF-851). Main promotes
+# the scanned PR image instead of rebuilding it, so this order mainly speeds up the PR bake.
 ARG CLAUDE_CODE_VERSION=2.1.326
 ARG CLAUDE_AGENT_ACP_VERSION=0.112.0
 ARG CODEX_VERSION=0.172.0
