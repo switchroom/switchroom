@@ -7,7 +7,7 @@
     "@anthropic-ai/claude-code": "2.1.325",
     "@openai/codex": "0.172.0",
     "@xai-official/grok": "1.0.92",
-    "opencode-ai": "1.19.5"
+    "opencode-ai": "1.19.6"
   },
   "overrides": {
     "proxy-addr": "2.0.8"
