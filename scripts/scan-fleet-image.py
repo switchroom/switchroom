@@ -13,6 +13,9 @@ manifest, then lets the two independent scanners share it:
   push while Syft is still working.
 * ``trivy`` runs Trivy in the foreground against the same archive with the
   vulnerability database that ``prefetch-db`` downloaded earlier in the job.
+* ``trivy-remote`` (HF-851 promotion) runs the same CRITICAL scan against an immutable registry
+  digest instead of an archive. With the layer cache the PR run staged, only the vulnerability
+  match against today's database runs; no multi-GB pull or export.
 * ``wait-sbom`` blocks until the detached Syft run has written its status,
   fails closed on any non-zero status, a missing status, an empty document or a
   timeout, and then removes the state directory.
@@ -221,10 +224,13 @@ def wait_sbom(args: argparse.Namespace) -> None:
 # --- trivy -------------------------------------------------------------------
 
 
-def trivy_command(trivy: str, archive: Path, output: Path, *, timeout: str) -> list[str]:
+def trivy_command(trivy: str, archive: Path | None, output: Path, *, timeout: str, image: str | None = None) -> list[str]:
+    if (archive is None) == (image is None):
+        fail("scan exactly one of an archive or an immutable image reference")
+    source = ["--input", str(archive)] if archive is not None else ["--image-src", "remote"]
     return [
         trivy, "image",
-        "--input", str(archive),
+        *source,
         "--format", "json",
         "--output", str(output),
         "--scanners", "vuln",
@@ -233,6 +239,7 @@ def trivy_command(trivy: str, archive: Path, output: Path, *, timeout: str) -> l
         "--exit-code", "0",
         "--skip-db-update",
         "--timeout", timeout,
+        *([image] if image is not None else []),
     ]
 
 
@@ -241,12 +248,7 @@ def prefetch_db(args: argparse.Namespace) -> None:
     run_checked([trivy, "image", "--download-db-only"], timeout=args.timeout_seconds)
 
 
-def trivy(args: argparse.Namespace) -> None:
-    trivy_bin = require_tool(args.trivy)
-    if not args.archive.is_file():
-        fail(f"archive {args.archive} does not exist")
-    args.output.unlink(missing_ok=True)
-    run_checked(trivy_command(trivy_bin, args.archive, args.output, timeout=args.timeout), timeout=args.timeout_seconds)
+def check_report(args: argparse.Namespace) -> None:
     if not args.output.is_file() or args.output.stat().st_size == 0:
         fail(f"Trivy reported success but {args.output} is missing or empty")
     try:
@@ -255,6 +257,28 @@ def trivy(args: argparse.Namespace) -> None:
         fail(f"Trivy output {args.output} is not JSON: {exc}")
     if not isinstance(report, dict) or "Results" not in report and "SchemaVersion" not in report:
         fail(f"Trivy output {args.output} is not a Trivy JSON report")
+
+
+def trivy(args: argparse.Namespace) -> None:
+    trivy_bin = require_tool(args.trivy)
+    if not args.archive.is_file():
+        fail(f"archive {args.archive} does not exist")
+    args.output.unlink(missing_ok=True)
+    run_checked(trivy_command(trivy_bin, args.archive, args.output, timeout=args.timeout), timeout=args.timeout_seconds)
+    check_report(args)
+
+
+def trivy_remote(args: argparse.Namespace) -> None:
+    trivy_bin = require_tool(args.trivy)
+    if "@sha256:" not in args.image or len(args.image.rsplit("@sha256:", 1)[1]) != 64:
+        fail(f"{args.image} is not an immutable sha256 digest reference")
+    args.output.unlink(missing_ok=True)
+    run_checked(trivy_command(trivy_bin, None, args.output, timeout=args.timeout, image=args.image),
+                timeout=args.timeout_seconds)
+    check_report(args)
+    artifact = json.loads(args.output.read_text(encoding="utf-8")).get("ArtifactName")
+    if artifact != args.image:
+        fail(f"Trivy scanned {artifact!r}, not {args.image}")
 
 
 # --- cli ---------------------------------------------------------------------
@@ -306,6 +330,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--timeout", default="10m", help="Trivy's own --timeout")
     p.add_argument("--timeout-seconds", type=float, default=900)
     p.set_defaults(func=trivy)
+
+    p = commands.add_parser("trivy-remote", help="scan an immutable registry digest for CRITICAL vulnerabilities")
+    p.add_argument("--image", required=True)
+    p.add_argument("--output", type=Path, required=True)
+    p.add_argument("--trivy", default="trivy")
+    p.add_argument("--timeout", default="10m", help="Trivy's own --timeout")
+    p.add_argument("--timeout-seconds", type=float, default=900)
+    p.set_defaults(func=trivy_remote)
     return parser
 
 

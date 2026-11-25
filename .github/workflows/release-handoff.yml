@@ -6,8 +6,9 @@ name: Release Handoff
 # workflow file and the default commit context come from main's current HEAD,
 # not from the published commit, so it only consumes the triggering run's own
 # handoff artifact, addressed by that run's id and head_sha, and hands it to
-# hermes-fleet-private's release conductor, which opens (or finds) the Stage A
-# PR through the GitHub contents API and arms squash auto-merge. It is the only
+# hermes-fleet-private's release conductor, which commits Stage A to private
+# main through the git data API (HF-851; older conductors open the Stage A PR
+# and arm squash auto-merge instead). It is the only
 # workflow in this repository that touches the release bot's private key;
 # fleet-image.yml keeps the registry-write grant and no secret reference.
 
@@ -28,7 +29,7 @@ concurrency:
 
 jobs:
   stage-a:
-    name: Open private Stage A PR
+    name: Hand off to private Stage A
     runs-on: ubuntu-latest
     timeout-minutes: 20
     if: >-
@@ -113,7 +114,7 @@ jobs:
           persist-credentials: false
           path: private
 
-      - name: Open or reuse the Stage A PR and arm auto-merge
+      - name: Commit Stage A to private main
         if: steps.locate.outputs.present == 'true'
         working-directory: private
         env:
@@ -122,9 +123,16 @@ jobs:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           set -euo pipefail
+          # HF-851 single workflow: the release bot commits Stage A straight to private main (no PR
+          # hop); that push starts the private bake, which waits for green exact-main CI before any
+          # registry write. A conductor without the stage falls back to the auto-merged Stage A PR.
+          if grep -q '"private-stage-a-commit"' scripts/release-conductor.py; then
+            stage=(private-stage-a-commit)
+          else
+            stage=(--auto-merge private-stage-a-pr)
+          fi
           python3 scripts/release-conductor.py \
             --workdir "$RUNNER_TEMP/conductor" \
             --state "$RUNNER_TEMP/state.json" \
             --fleet-handoff "$HANDOFF_FILE" \
-            --auto-merge \
-            private-stage-a-pr
+            "${stage[@]}"

@@ -264,8 +264,12 @@ COPY contracts/ /opt/hermes-fleet/contracts/
 ARG AGENT_IMAGE
 ARG ONEPASSWORD_CLI_IMAGE
 ARG FLEET_GIT_SHA=development
+# Content identity (HF-851): the git tree the image was built from. A main commit and the PR head it
+# squash-merged share it, so the exact scanned PR image can be promoted on main instead of rebuilt.
+ARG FLEET_SOURCE_TREE=development
 ARG FLEET_IMAGE_IDENTITY=local/hermes-fleet
 ENV HERMES_FLEET_GIT_SHA=${FLEET_GIT_SHA} \
+    HERMES_FLEET_SOURCE_TREE=${FLEET_SOURCE_TREE} \
     HERMES_FLEET_IMAGE_IDENTITY=${FLEET_IMAGE_IDENTITY} \
     HERMES_FLEET_AGENT_IMAGE=${AGENT_IMAGE} \
     HERMES_FLEET_ONEPASSWORD_CLI_IMAGE=${ONEPASSWORD_CLI_IMAGE} \
@@ -277,8 +281,9 @@ ENV HERMES_FLEET_GIT_SHA=${FLEET_GIT_SHA} \
     HERMES_FLEET_CLAUDE_ACP_PLUGIN_REVISION=${CLAUDE_ACP_PLUGIN_REVISION}
 LABEL org.opencontainers.image.source="https://github.com/switchroom/switchroom" \
       org.opencontainers.image.revision="${FLEET_GIT_SHA}" \
+      hermes-fleet.source-tree="${FLEET_SOURCE_TREE}" \
       org.opencontainers.image.base.name="${AGENT_IMAGE}"
-RUN python3 -c 'import json, os, pathlib; marker = pathlib.Path("/etc/hermes-fleet/image-provenance.json"); marker.parent.mkdir(parents=True, exist_ok=True); marker.write_text(json.dumps({"schema": 1, "deployment_kind": "fleet_child_image", "image": os.environ["HERMES_FLEET_IMAGE_IDENTITY"], "revision": os.environ["HERMES_FLEET_GIT_SHA"], "parent_agent_image": os.environ["HERMES_FLEET_AGENT_IMAGE"], "onepassword_cli_image": os.environ["HERMES_FLEET_ONEPASSWORD_CLI_IMAGE"], "claude_code_version": os.environ["HERMES_FLEET_CLAUDE_CODE_VERSION"], "claude_agent_acp_version": os.environ["HERMES_FLEET_CLAUDE_AGENT_ACP_VERSION"], "codex_version": os.environ["HERMES_FLEET_CODEX_VERSION"], "grok_version": os.environ["HERMES_FLEET_GROK_VERSION"], "claude_acp_plugin_source": os.environ["HERMES_FLEET_CLAUDE_ACP_PLUGIN_SOURCE"], "claude_acp_plugin_revision": os.environ["HERMES_FLEET_CLAUDE_ACP_PLUGIN_REVISION"]}, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8"); marker.chmod(0o444)'
+RUN python3 -c 'import json, os, pathlib; marker = pathlib.Path("/etc/hermes-fleet/image-provenance.json"); marker.parent.mkdir(parents=True, exist_ok=True); marker.write_text(json.dumps({"schema": 1, "deployment_kind": "fleet_child_image", "image": os.environ["HERMES_FLEET_IMAGE_IDENTITY"], "revision": os.environ["HERMES_FLEET_GIT_SHA"], "tree": os.environ["HERMES_FLEET_SOURCE_TREE"], "parent_agent_image": os.environ["HERMES_FLEET_AGENT_IMAGE"], "onepassword_cli_image": os.environ["HERMES_FLEET_ONEPASSWORD_CLI_IMAGE"], "claude_code_version": os.environ["HERMES_FLEET_CLAUDE_CODE_VERSION"], "claude_agent_acp_version": os.environ["HERMES_FLEET_CLAUDE_AGENT_ACP_VERSION"], "codex_version": os.environ["HERMES_FLEET_CODEX_VERSION"], "grok_version": os.environ["HERMES_FLEET_GROK_VERSION"], "claude_acp_plugin_source": os.environ["HERMES_FLEET_CLAUDE_ACP_PLUGIN_SOURCE"], "claude_acp_plugin_revision": os.environ["HERMES_FLEET_CLAUDE_ACP_PLUGIN_REVISION"]}, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8"); marker.chmod(0o444)'
 RUN groupmod -g 1000 hermes \
     && usermod -u 1000 -g 1000 hermes \
     && mkdir -p /run \

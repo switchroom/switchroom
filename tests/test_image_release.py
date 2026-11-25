@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import ast
+import contextlib
+import importlib.util
+import io
 import hashlib
 import json
 import re
@@ -387,7 +390,9 @@ class FleetImageReleaseTests(unittest.TestCase):
             "scripts/read-agent-image-manifest.py",
             "release/agent-image-manifest.json",
             "AGENT_IMAGE=${{ steps.agent.outputs.AGENT_IMAGE }}",
+            "FLEET_GIT_SHA=${{ steps.identity.outputs.revision }}",
             "FLEET_GIT_SHA=${{ github.sha }}",
+            "FLEET_SOURCE_TREE=${{ steps.identity.outputs.tree }}",
             "FLEET_IMAGE_IDENTITY=${{ env.IMAGE_REPOSITORY }}",
             "EXPECTED_AGENT_REVISION",
             "/etc/hermes/image-provenance.json",
@@ -553,14 +558,16 @@ class FleetImageReleaseTests(unittest.TestCase):
         # Trivy comes from the exact GitHub release asset with a pinned sha256 (setup-trivy's
         # get.trivy.dev download host stopped resolving on 2026-11-04).
         self.assertNotIn("aquasecurity/setup-trivy@", text)
-        self.assertEqual(text.count("releases/download/v${version}/trivy_${version}_Linux-64bit.tar.gz"), 2)
+        # preflight_bake, publish and promote (HF-851) each install the same pinned Trivy.
+        self.assertEqual(text.count("releases/download/v${version}/trivy_${version}_Linux-64bit.tar.gz"), 3)
         self.assertEqual(text.count('sha256sum --check --strict'),
                          text.count("TRIVY_SHA256: ") + text.count("SYFT_SHA256: "))
-        self.assertEqual(text.count("TRIVY_SHA256: "), 2)
+        self.assertEqual(text.count("TRIVY_SHA256: "), 3)
         self.assertEqual(text.count("SYFT_SHA256: "), 2)
-        self.assertEqual(text.count("bash scripts/fetch-pinned-release-asset.sh"), 4)
+        self.assertEqual(text.count("bash scripts/fetch-pinned-release-asset.sh"), 5)
         self.assertNotIn("anchore/sbom-action/download-syft@", text)
-        self.assertEqual(text.count("scripts/scan-fleet-image.py trivy"), 2)
+        self.assertEqual(text.count("scripts/scan-fleet-image.py trivy \\"), 2)
+        self.assertEqual(text.count("scripts/scan-fleet-image.py trivy-remote"), 1)
         self.assertNotIn("aquasecurity/trivy-action@", text)
         scanner = (ROOT / "scripts/scan-fleet-image.py").read_text(encoding="utf-8")
         for flag in ('"--severity", "CRITICAL"', '"--scanners", "vuln"', '"--ignore-unfixed"', '"--skip-db-update"', '"--input"'):
@@ -616,6 +623,37 @@ class FleetImageReleaseTests(unittest.TestCase):
             self.assertEqual(data["fleet"]["source_repository"], "https://github.com/switchroom/switchroom")
             self.assertEqual(data["agent"]["immutable_ref"], AGENT_REF)
             self.assertEqual(output.read_text(encoding="utf-8"), json.dumps(data, indent=2, sort_keys=True) + "\n")
+
+    def test_fleet_handoff_carries_content_identity_for_promoted_images(self) -> None:
+        base = ["python3", str(EMIT_MANIFEST), "--repository", "ghcr.io/switchroom/switchroom", "--revision", "b" * 40,
+                "--digest", "sha256:" + "a" * 64, "--agent-manifest", str(AGENT_MANIFEST)]
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "handoff.json"
+            result = subprocess.run([*base, "--tree", "c" * 40, "--image-revision", "d" * 40, "--output", str(output)],
+                                    cwd=ROOT, text=True, capture_output=True, check=False)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            fleet = json.loads(output.read_text(encoding="utf-8"))["fleet"]
+            # revision stays the published main commit; the tree and the stamped PR head ride beside it.
+            self.assertEqual((fleet["revision"], fleet["tree"], fleet["image_revision"]), ("b" * 40, "c" * 40, "d" * 40))
+            for extra in (["--image-revision", "d" * 40], ["--tree", "main"], ["--tree", "c" * 40, "--image-revision", "x"]):
+                with self.subTest(extra=extra):
+                    result = subprocess.run([*base, *extra, "--output", str(Path(directory) / "bad.json")],
+                                            cwd=ROOT, text=True, capture_output=True, check=False)
+                    self.assertNotEqual(result.returncode, 0)
+
+    def test_remote_trivy_scan_uses_the_same_policy_on_an_immutable_digest(self) -> None:
+        spec = importlib.util.spec_from_file_location("scan_fleet_image", ROOT / "scripts/scan-fleet-image.py")
+        scan = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(scan)
+        ref = "ghcr.io/switchroom/switchroom@sha256:" + "a" * 64
+        remote = scan.trivy_command("trivy", None, Path("out.json"), timeout="10m", image=ref)
+        local = scan.trivy_command("trivy", Path("img.tar"), Path("out.json"), timeout="10m")
+        self.assertEqual(remote[-1], ref)
+        self.assertEqual(remote[remote.index("--image-src") + 1], "remote")
+        for flag in ("--severity", "--scanners", "--ignore-unfixed", "--skip-db-update", "--exit-code"):
+            self.assertEqual(remote[remote.index(flag):remote.index(flag) + 2], local[local.index(flag):local.index(flag) + 2])
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            scan.trivy_command("trivy", Path("img.tar"), Path("out.json"), timeout="10m", image=ref)
 
     def test_compact_sbom_removes_file_surfaces_and_is_deterministic(self) -> None:
         document = {

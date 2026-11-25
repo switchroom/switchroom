@@ -38,6 +38,10 @@ def main() -> int:
     parser.add_argument("--revision", required=True)
     parser.add_argument("--digest", required=True)
     parser.add_argument("--agent-manifest", type=Path, required=True)
+    # HF-851 content identity: the source tree (image label hermes-fleet.source-tree) and, for a promoted
+    # PR image, the tree-identical commit its revision label names. `revision` stays the main commit.
+    parser.add_argument("--tree", default="")
+    parser.add_argument("--image-revision", default="")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
 
@@ -49,6 +53,12 @@ def main() -> int:
         raise SystemExit("Agent immutable_ref mismatch")
     fleet = image_identity(args.repository, args.revision, args.digest)
     fleet["source_repository"] = "https://github.com/switchroom/switchroom"
+    if args.tree:
+        fleet["tree"] = require(args.tree, REVISION_RE, "tree")
+    if args.image_revision:
+        if not args.tree:
+            raise SystemExit("--image-revision needs --tree")
+        fleet["image_revision"] = require(args.image_revision, REVISION_RE, "image revision")
     manifest = {
         "schema_version": 1,
         "agent": agent,

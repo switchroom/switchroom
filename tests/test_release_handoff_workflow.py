@@ -102,14 +102,14 @@ class ReleaseHandoffWorkflowTests(unittest.TestCase):
         self.assertIn(f"token: {APP_TOKEN}", checkout)
         self.assertIn("persist-credentials: false", checkout)
         self.assertIn("path: private", checkout)
-        run = step(self.text, "Open or reuse the Stage A PR and arm auto-merge")
+        run = step(self.text, "Commit Stage A to private main")
         self.assertIn(f"GH_TOKEN: {APP_TOKEN}", run)
         self.assertNotIn("echo", run)
         self.assertNotIn("git config", self.text)
         self.assertNotIn("skip-token-revoke", self.text)
 
     def test_conductor_is_invoked_from_the_private_checkout_with_the_downloaded_handoff(self) -> None:
-        run = step(self.text, "Open or reuse the Stage A PR and arm auto-merge")
+        run = step(self.text, "Commit Stage A to private main")
         self.assertIn("working-directory: private", run)
         self.assertIn("python3 scripts/release-conductor.py", run)
         # Global options precede the stage subcommand (argparse subparsers take no options).
@@ -118,9 +118,14 @@ class ReleaseHandoffWorkflowTests(unittest.TestCase):
             '--workdir "$RUNNER_TEMP/conductor"',
             '--state "$RUNNER_TEMP/state.json"',
             '--fleet-handoff "$HANDOFF_FILE"',
-            "--auto-merge",
         ):
-            self.assertLess(invocation.index(option), invocation.index("private-stage-a-pr"), option)
+            self.assertLess(invocation.index(option), invocation.index('"${stage[@]}"'), option)
+        # HF-851 single workflow: Stage A is committed to private main; a conductor without that
+        # stage falls back to the auto-merged Stage A PR (flags still before the stage name).
+        selection = run.split("python3 scripts/release-conductor.py", 1)[0]
+        self.assertIn("stage=(private-stage-a-commit)", selection)
+        self.assertIn("stage=(--auto-merge private-stage-a-pr)", selection)
+        self.assertIn("""grep -q '"private-stage-a-commit"' scripts/release-conductor.py""", selection)
         self.assertNotIn("--dry-run", invocation)
         self.assertNotIn("--core-commit", invocation)
         self.assertNotIn("run-all", invocation)
