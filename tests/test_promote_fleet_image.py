@@ -379,7 +379,12 @@ class WorkflowWiringTests(unittest.TestCase):
         self.assertIs(steps[locate]["continue-on-error"], True)
         self.assertIs(steps[cached]["continue-on-error"], True)
         self.assertEqual(steps[cached]["if"], "steps.stage.outputs.found == 'true'")
-        self.assertEqual(steps[cached]["with"]["cache-from"], "type=registry,ref=${{ steps.stage.outputs.ref }}")
+        # The tree-identical PR stage first, then the moving layer-cache tag (HF-851).
+        self.assertEqual(steps[cached]["with"]["cache-from"].splitlines(),
+                         ["type=registry,ref=${{ steps.stage.outputs.ref }}", "type=registry,ref=${{ env.BUILDCACHE_REF }}"])
+        self.assertEqual(steps[full]["with"]["cache-from"], "type=registry,ref=${{ env.BUILDCACHE_REF }}")
+        for step in (cached, full):
+            self.assertEqual(steps[step]["with"]["cache-to"], "type=inline")
         self.assertFalse(steps[cached]["with"]["push"])
         self.assertEqual(steps[full]["if"],
                          "steps.stage.outputs.found != 'true' || steps.build_cached.outcome != 'success'")
@@ -394,6 +399,17 @@ class WorkflowWiringTests(unittest.TestCase):
                      "Revalidate scoped VEX decision before publication", "Verify exact main CI gate",
                      "Verify remote immutable manifest identity", "Attest published digest", "Attest published SBOM"):
             self.assertGreater(names.index(gate), full, gate)
+
+    def test_layer_cache_tag_moves_last_and_off_the_evidence_path(self) -> None:
+        steps, names = self.steps("publish")
+        move = names.index("Move the layer-cache tag to the published digest")
+        self.assertEqual(move, len(names) - 1)
+        self.assertIs(steps[move]["continue-on-error"], True)
+        self.assertIn("${{ steps.publish.outputs.digest }}", steps[move]["env"]["IMMUTABLE_REF"])
+        for gate in ("Attest published digest", "Attest published SBOM"):
+            self.assertLess(names.index(gate), move, gate)
+        # Nothing before the move writes the cache tag.
+        self.assertNotIn("$BUILDCACHE_REF", json.dumps(steps[:move]))
 
     def test_trivy_cache_lives_outside_the_build_context(self) -> None:
         for job in ("preflight_bake", "publish"):
