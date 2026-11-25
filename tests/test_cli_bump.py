@@ -138,8 +138,19 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("github.repository == 'switchroom/switchroom'", self.text)
         self.assertEqual(set(re.findall(r"group: \[([^\]]+)\]", self.text)), {"auto, review"})
 
+    def test_existing_bot_branch_is_updated_with_an_explicit_lease(self):
+        # A bare --force-with-lease has no tracking ref after a main-only checkout and is rejected as stale info.
+        self.assertNotRegex(self.text, r'--force-with-lease origin')
+        self.assertIn('git ls-remote origin "refs/heads/$branch"', self.text)
+        self.assertIn('--force-with-lease="refs/heads/$branch:${remote_head}"', self.text)
+
+    def test_token_can_read_required_checks_but_writes_only_what_it_needs(self):
+        perms = dict(re.findall(r"permission-([a-z-]+): (read|write)", self.text))
+        self.assertEqual(perms, {"contents": "write", "pull-requests": "write", "workflows": "write",
+                                 "checks": "read", "statuses": "read", "actions": "read"})
+
     def test_actions_are_pinned_to_commits(self):
-        for use in re.findall(r"uses: (\S+)", self.text):
+        for use in re.findall(r"(?m)^\s*(?:- )?uses: (\S+)", self.text):
             self.assertRegex(use, r"@[0-9a-f]{40}$")
 
 
