@@ -232,7 +232,7 @@ RUN test ! -e /opt/hermes/plugins/web/perplexity
 # the cheap provenance tail, while the apt desktop/Chromium, Camoufox, camofox-browser and Honcho
 # layers above stay in the BuildKit/registry cache. Layer order: base OS (Agent parent) -> pinned
 # desktop/browser runtimes -> Honcho -> pinned CLIs -> provenance stamp (HF-851).
-ARG CLAUDE_CODE_VERSION=2.1.325
+ARG CLAUDE_CODE_VERSION=2.1.326
 ARG CLAUDE_AGENT_ACP_VERSION=0.112.0
 ARG CODEX_VERSION=0.172.0
 ARG GROK_VERSION=1.0.92
