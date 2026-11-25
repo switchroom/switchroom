@@ -144,8 +144,11 @@ class ReleaseHandoffWorkflowTests(unittest.TestCase):
         pr_auto_update = WORKFLOWS / "pr-auto-update.yml"
         # The auto-revert bot pushes its revert branch with the App so the revert PR's CI runs.
         auto_revert = WORKFLOWS / "auto-revert.yml"
-        allowed = {HANDOFF, pin_handoff, pr_auto_update, auto_revert}
+        # The CLI bump bot (HF-851) opens its PRs with the App so their CI runs (a GITHUB_TOKEN PR runs none).
+        cli_bump = WORKFLOWS / "cli-bump.yml"
+        allowed = {HANDOFF, pin_handoff, pr_auto_update, auto_revert, cli_bump}
         self.assertIn(auto_revert, workflows)
+        self.assertIn(cli_bump, workflows)
         self.assertIn(HANDOFF, workflows)
         self.assertIn(pin_handoff, workflows)
         self.assertIn(pr_auto_update, workflows)
