@@ -31,7 +31,7 @@ env:
   # digest only, and it is moved after promotion, the CI gate and every scan.
   BUILDCACHE_REF: ghcr.io/switchroom/switchroom:buildcache
   ONEPASSWORD_CLI_IMAGE: docker.io/1password/op@sha256:b0d7eebcb09bdc9d5862af91533e1851c968d4f969270c906f5da8c574f87e93
-  CLAUDE_CODE_VERSION: "2.1.325"
+  CLAUDE_CODE_VERSION: "2.1.326"
   CLAUDE_AGENT_ACP_VERSION: "0.112.0"
   CODEX_VERSION: "0.172.0"
   GROK_VERSION: "1.0.92"
