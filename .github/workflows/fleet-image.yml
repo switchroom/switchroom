@@ -24,6 +24,12 @@ concurrency:
 env:
   IMAGE_REPOSITORY: ghcr.io/switchroom/switchroom
   TEST_IMAGE: ghcr.io/switchroom/switchroom:sha-${{ github.sha }}
+  # HF-851 layer cache: a moving tag on the newest published digest. Every publish build embeds inline
+  # cache metadata, so PR and publish builds import it (cache-from) and a CLI-only change rebuilds just
+  # the CLI layer. The runner keeps the docker driver, which only supports inline cache, not
+  # cache-to type=registry. The tag names no candidate: handoff manifests and pins use the immutable
+  # digest only, and it is moved after promotion, the CI gate and every scan.
+  BUILDCACHE_REF: ghcr.io/switchroom/switchroom:buildcache
   ONEPASSWORD_CLI_IMAGE: docker.io/1password/op@sha256:b0d7eebcb09bdc9d5862af91533e1851c968d4f969270c906f5da8c574f87e93
   CLAUDE_CODE_VERSION: "2.1.325"
   CLAUDE_AGENT_ACP_VERSION: "0.112.0"
@@ -215,6 +221,7 @@ jobs:
           load: true
           push: false
           tags: ${{ env.TEST_IMAGE }}
+          cache-from: type=registry,ref=${{ env.BUILDCACHE_REF }}
           # Inline cache metadata lets main reuse these layers when it builds the same tree.
           cache-to: type=inline
           build-args: |
@@ -705,7 +712,10 @@ jobs:
           load: true
           push: false
           tags: ${{ env.TEST_IMAGE }}
-          cache-from: type=registry,ref=${{ steps.stage.outputs.ref }}
+          cache-from: |
+            type=registry,ref=${{ steps.stage.outputs.ref }}
+            type=registry,ref=${{ env.BUILDCACHE_REF }}
+          cache-to: type=inline
           build-args: |
             AGENT_IMAGE=${{ env.AGENT_IMAGE }}
             ONEPASSWORD_CLI_IMAGE=${{ env.ONEPASSWORD_CLI_IMAGE }}
@@ -730,6 +740,8 @@ jobs:
           load: true
           push: false
           tags: ${{ env.TEST_IMAGE }}
+          cache-from: type=registry,ref=${{ env.BUILDCACHE_REF }}
+          cache-to: type=inline
           build-args: |
             AGENT_IMAGE=${{ env.AGENT_IMAGE }}
             ONEPASSWORD_CLI_IMAGE=${{ env.ONEPASSWORD_CLI_IMAGE }}
@@ -1068,3 +1080,13 @@ jobs:
           path: fleet-image-handoff.json
           if-no-files-found: error
           retention-days: 90
+
+      - name: Move the layer-cache tag to the published digest
+        # Off the evidence path: runs after promotion, attestation and upload. Same single-manifest
+        # bytes, so the digest does not change; a failure only costs the next build its cache.
+        continue-on-error: true
+        env:
+          IMMUTABLE_REF: ${{ env.IMAGE_REPOSITORY }}@${{ steps.publish.outputs.digest }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create --prefer-index=false --tag "$BUILDCACHE_REF" "$IMMUTABLE_REF"
