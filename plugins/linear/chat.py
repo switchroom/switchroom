@@ -49,7 +49,8 @@ SCHEMA = {
         "its original requester is unknown and it grants no permission. "
         "create_issue, create_project, link_issue, update_description and add_comment work without "
         "a task link or chat claim. Required fields, so the first call succeeds: create_issue id and title, plus team, "
-        "project or parent (an omitted project defaults as described under project); create_project id, name and team; "
+        "project or parent (an omitted project defaults as described under project), and optional labels naming existing "
+        "labels (a product coding issue carries its product label); create_project id, name and team; "
         "link_issue issue, related and relation; update_description issue, id, description and expected_description; "
         "add_comment issue, id and body. Description replacement requires the exact expected_description. "
         "Questions, status checks and short commands need no issue: just answer in the conversation. "
@@ -104,6 +105,7 @@ SCHEMA = {
         "project": {"type": "string", "description": "create_issue: project id, exact project name or URL slug of an active project, in any team this app can see; names are matched exactly (ignoring case), never by part of a name. Omitted: the parent's project, else the active project this agent last filed a new issue into for team (or the team's only active project); the reply names the project used. Only when none of those exists is the call refused with the active projects (per team when team is omitted) to choose from. Use \"none\" (with team) only when the work fits no project. Never ask the user for project ids."},
         "start_work": {"type": "boolean", "description": "create_issue: true when the user asked for a longer outcome to be carried out now; starts one native task, delegates the issue to this app and reports back to this chat. false (default) for a quick note or someone else's issue. work_on always starts."},
         "repo": {"type": "string", "description": "create_issue with start_work, or work_on: the coding project (Hermes project slug, such as web-app) when the work is code in that product's repo; the new task gets its own worktree and branch of the canonical repo. Omit for anything else (it then follows the issue's product label, else a scratch folder). Existing work keeps its workspace."},
+        "labels": {"type": "array", "items": {"type": "string"}, "description": "create_issue: names of existing labels of the issue's team or workspace, matched ignoring case. Product coding work carries its product label (such as web-app), which also gives started work that product's worktree. A name that matches no label, or several, is refused and nothing is created; labels are never created."},
         "record_done": {"type": "boolean", "description": "create_issue or work_on: link and close work already finished in this chat; requires summary. Nothing is started or re-run."},
         "summary": {"type": "string", "description": "record_done: what was delivered and what remains, for the closing Linear summary."},
         "evidence": {"type": "array", "items": {"type": "string"}, "description": "record_done: evidence links such as the PR, merged commit, deploy check or findings."},
@@ -382,7 +384,7 @@ def _stored_differently(created: dict) -> str:
             " Do not create it again. Read it and edit it only if the difference matters.")
 
 
-LIST_TEAMS, LIST_PROJECTS, LIST_CHOICES = 20, 15, 10
+LIST_TEAMS, LIST_PROJECTS, LIST_CHOICES, LIST_LABELS = 20, 15, 10, 100
 _UUID_SHAPE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|[0-9a-fA-F]{32}")
 _DESTINATION_TIP = (" Decide from the conversation and retry; do not ask the user for ids. "
                     "Use project \"none\" (with a team) only when the work fits no project.")
@@ -627,6 +629,46 @@ def _entrust_request(args: dict, action: str, context: Any) -> tuple[bool, dict 
     if (start or done) and context.delegated_child:
         raise LinearError("Native delegated children cannot start work; return the request to the parent agent.")
     return bool(start or done), record
+
+
+def _label_request(args: dict) -> list[str]:
+    """Validate ``labels`` before any read or write: a list of label names, repeats dropped."""
+    names = args.get("labels", [])
+    if not isinstance(names, list) or any(not isinstance(name, str) or not name.strip() for name in names):
+        raise ValueError("labels must be a list of existing label names.")
+    unique: dict[str, str] = {}
+    for name in names:
+        unique.setdefault(name.strip().casefold(), name.strip())
+    return list(unique.values())
+
+
+def _label_ids(bridge: Any, team: str | None, names: list[str]) -> tuple[list[str], str]:
+    """(label ids, refusal reply or "") for names of existing labels an issue in ``team`` can carry.
+
+    Each name must match exactly one label, ignoring case. Labels are never created: an unknown or
+    ambiguous name refuses the whole create, so nothing lands half-labelled."""
+    if not names:
+        return [], ""
+    available, more = bridge.api.team_labels(team)
+    ids, unknown, ambiguous = [], [], []
+    for name in names:
+        found = [label["id"] for label in available if label["name"].casefold() == name.casefold()]
+        if len(found) == 1:
+            ids.append(found[0])
+        else:
+            (ambiguous if found else unknown).append(name)
+    if not unknown and not ambiguous:
+        return ids, ""
+    problems = []
+    if unknown:
+        problems.append(f"No existing label matches {', '.join(repr(name) for name in unknown)}"
+                        + (" among the first labels read" if more else ""))
+    if ambiguous:
+        problems.append(f"several labels are named {', '.join(repr(name) for name in ambiguous)}")
+    shown = sorted({label["name"] for label in available}, key=str.casefold)
+    return [], _reply(False, "; ".join(problems) + ". Labels are never created, so nothing was created. Retry with "
+                      "label names from this list, or without labels.", code="unknown_label",
+                      unknown=unknown, ambiguous=ambiguous, labels=shown[:LIST_LABELS])
 
 
 def _workspace_request(bridge: Any, args: dict, starts: bool) -> str | None:
@@ -1067,15 +1109,19 @@ def _plan(bridge: Any, args: dict, action: str, context: Any) -> str:
         if not title:
             raise ValueError("create_issue needs a title.")
         parent = _text(args, "parent") or None
+        names = _label_request(args)
         entrust, record = _entrust_request(args, action, context)
         workspace = _workspace_request(bridge, args, entrust and not record)
         team, project_id, note, refusal = _issue_destination(bridge, team, _text(args, "project"), parent)
         if refusal:
             return refusal
+        label_ids, refusal = _label_ids(bridge, team, names)
+        if refusal:
+            return refusal
         note = note + " " if note else ""
         try:
             created = bridge.api.create_issue(client_id, team, title, description=args.get("description"),
-                                              project_id=project_id, parent_id=parent)
+                                              project_id=project_id, parent_id=parent, label_ids=label_ids)
         except RateLimited:
             raise
         except LinearError as exc:

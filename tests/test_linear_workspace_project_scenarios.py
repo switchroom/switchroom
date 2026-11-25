@@ -26,6 +26,11 @@ class Harness(unittest.TestCase):
     human_delegation = entrust.ChatEntrustScenarios.human_delegation
 
 
+TEAM_LABELS = [{"id": "label-shop", "name": "Storefront", "isGroup": False},
+               {"id": "label-bug", "name": "Bug", "isGroup": False},
+               {"id": "label-area", "name": "Area", "isGroup": True}]
+
+
 class LabelAuthority(ChatAuthority):
     def __init__(self):
         super().__init__()
@@ -34,6 +39,18 @@ class LabelAuthority(ChatAuthority):
     def transport(self, url, body, headers):
         import json
         payload = json.loads(body)
+        if "query TeamLabels(" in payload["query"]:
+            self.requests.append(payload["query"])
+            return 200, {}, json.dumps({"data": {"team": {"id": payload["variables"]["id"], "labels": {
+                "nodes": TEAM_LABELS, "pageInfo": {"hasNextPage": False}}}}}).encode()
+        if "issueCreate" in payload["query"]:
+            fields = payload["variables"]["input"]
+            reply = super().transport(url, body, headers)
+            names = {label["id"]: label["name"] for label in TEAM_LABELS}
+            if fields["id"] not in self.labels:  # a replay keeps the first create's labels
+                self.labels[fields["id"]] = [names[label_id] for label_id in fields.get("labelIds", [])]
+                self.issues[fields["id"]]["labels"] = {"nodes": [{"id": i} for i in fields.get("labelIds", [])]}
+            return reply
         if "query IssueLabels(" in payload["query"]:
             self.requests.append(payload["query"])
             issue_id = (payload.get("variables") or {})["id"]
@@ -149,6 +166,54 @@ class WorkspaceProjectScenarios(Harness):
         self.assertNotIn(NEW_ISSUE, self.authority.issues)
         self.assertEqual(self.tasks(), [])
         self.assertFalse(any("issueCreate" in query for query in self.authority.mutations))
+
+    def test_agent_filed_create_with_its_product_label_runs_in_the_project_worktree(self):
+        reply = self.create(start_work=True, labels=["storefront", "BUG", "Storefront"])  # case and repeats folded
+        self.assertTrue(reply["ok"], reply)
+        self.assertEqual(self.authority.labels[NEW_ISSUE], ["Storefront", "Bug"])
+        self.assertEqual(len([query for query in self.authority.mutations if "issueCreate" in query]), 1)
+        task = self.assert_project_worktree(reply["native"]["task_id"])
+        from hermes_cli import kanban_db_workspace as kbw
+        workspace = kbw.resolve_workspace(task)
+        with self.board.conn() as conn:
+            self.assertTrue(kb.complete_task(conn, task.id, result="done"))
+        self.assertFalse(workspace.exists())
+
+    def test_create_with_a_label_only_files_it_labelled(self):
+        reply = self.create(labels=["Bug"])
+        self.assertTrue(reply["ok"], reply)
+        self.assertEqual(self.authority.labels[NEW_ISSUE], ["Bug"])
+        self.assertEqual(self.tasks(), [])
+
+    def test_unknown_group_or_malformed_labels_are_refused_and_nothing_is_created(self):
+        for labels, unknown in ((["storefront", "no-such-label"], ["no-such-label"]), (["Area"], ["Area"])):
+            with self.subTest(labels=labels):
+                reply = self.create(start_work=True, labels=labels)
+                self.assertFalse(reply["ok"], reply)
+                self.assertEqual(reply["code"], "unknown_label")
+                self.assertEqual(reply["unknown"], unknown)
+                self.assertIn("never created", reply["message"])
+                self.assertEqual(reply["labels"], ["Bug", "Storefront"])
+        for labels in ("storefront", [""], [3]):
+            with self.subTest(labels=labels):
+                reply = self.create(start_work=True, labels=labels)
+                self.assertFalse(reply["ok"], reply)
+        self.assertNotIn(NEW_ISSUE, self.authority.issues)
+        self.assertEqual(self.tasks(), [])
+        self.assertFalse(any("issueCreate" in query or "LabelCreate" in query for query in self.authority.mutations))
+
+    def test_a_name_shared_by_two_labels_is_refused_without_a_guess(self):
+        TEAM_LABELS.append({"id": "label-bug-2", "name": "bug", "isGroup": False})  # e.g. children of two groups
+        self.addCleanup(TEAM_LABELS.pop)
+        reply = self.create(labels=["Bug"])
+        self.assertFalse(reply["ok"], reply)
+        self.assertEqual((reply["code"], reply["ambiguous"], reply["unknown"]), ("unknown_label", ["Bug"], []))
+        self.assertNotIn(NEW_ISSUE, self.authority.issues)
+
+    def test_create_without_labels_reads_no_team_labels(self):
+        reply = self.create()
+        self.assertTrue(reply["ok"], reply)
+        self.assertFalse(any("TeamLabels" in query for query in self.authority.requests))
 
     def test_record_done_never_gets_a_worktree(self):
         self.label(ISSUE, "storefront")

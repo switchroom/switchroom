@@ -1115,16 +1115,21 @@ class LinearAPI:
         self._create("projectUpdateCreate", "ProjectUpdateCreateInput",
                      {"id": client_id, "projectId": project_id, "body": body, "isDiffHidden": True})
     def create_issue(self, client_id: str, team_id: str, title: str, *, description: str | None = None,
-                     project_id: str | None = None, parent_id: str | None = None) -> dict[str, Any]:
-        """Create an issue as the authenticated app. Never assigns or delegates."""
+                     project_id: str | None = None, parent_id: str | None = None,
+                     label_ids: list[str] | None = None) -> dict[str, Any]:
+        """Create an issue as the authenticated app. Never assigns or delegates, never creates labels."""
         fields = {"id": client_id, "teamId": team_id, "title": title, "assigneeId": None, "delegateId": None}
         fields.update({key: value for key, value in (
-            ("description", description), ("projectId", project_id), ("parentId", parent_id)) if value is not None})
+            ("description", description), ("projectId", project_id), ("parentId", parent_id),
+            ("labelIds", label_ids or None)) if value is not None})
         replayed = self._create("issueCreate", "IssueCreateInput", fields)
         issue = self._read_created(
             "query CreatedIssue($id: String!) { issue(id: $id) { id identifier title description url "
-            "team { id key } project { id } parent { id } assignee { id } delegate { id } } }", "issue", client_id)
+            "team { id key } project { id } parent { id } assignee { id } delegate { id }"
+            + (" labels(first: 50) { nodes { id } }" if label_ids else "") + " } }", "issue", client_id)
         team, project, parent = (issue.get(key) or {} for key in ("team", "project", "parent"))
+        stored_labels = {node.get("id") for node in ((issue.get("labels") or {}).get("nodes") or [])
+                         if isinstance(node, dict)}
         delegate = issue.get("delegate")
         # A same-id replay finds the issue as the first create left it, and that create's own
         # start_work makes this app the delegate (seen live on a replayed chat create, 2026-11-24).
@@ -1138,7 +1143,24 @@ class LinearAPI:
             "description": description is not None and not created_markdown_matches(issue.get("description"), description),
             "assignee": issue.get("assignee") is not None, "delegate": delegate is not None and not own_delegate,
             "project": project_id is not None and project.get("id") != project_id,
-            "parent": parent_id is not None and parent.get("id") != parent_id})
+            "parent": parent_id is not None and parent.get("id") != parent_id,
+            "labels": bool(label_ids) and stored_labels != set(label_ids)})
+    def team_labels(self, team_id: str) -> tuple[list[dict[str, str]], bool]:
+        """(labels an issue in this team can carry, whether more exist than were read).
+
+        Linear's team label list holds the team's own labels and the workspace labels; archived
+        labels are left out. Label groups are only containers, so they are not returned."""
+        data = self.graphql("query TeamLabels($id: String!) { team(id: $id) { id labels(first: 250) "
+                            "{ nodes { id name isGroup } pageInfo { hasNextPage } } } }", {"id": team_id})
+        team = data.get("team")
+        page = team.get("labels") if isinstance(team, dict) else None
+        nodes = page.get("nodes") if isinstance(page, dict) else None
+        if not isinstance(page, dict) or not isinstance(nodes, list):
+            raise LinearError(f"Linear team {team_id} labels unavailable")
+        labels = [{"id": node["id"], "name": node["name"]} for node in nodes
+                  if isinstance(node, dict) and isinstance(node.get("id"), str) and isinstance(node.get("name"), str)
+                  and not node.get("isGroup")]
+        return labels, (page.get("pageInfo") or {}).get("hasNextPage") is True
     def issue_labels(self, issue_id: str) -> list[str]:
         """The names of one issue's labels (one small read, made only when a label map is set)."""
         data = self.graphql("query IssueLabels($id: String!) { issue(id: $id) { id labels(first: 50) "

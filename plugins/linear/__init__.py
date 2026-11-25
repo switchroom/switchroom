@@ -402,7 +402,8 @@ class BoundLinearAPI(LinearAPI):
         with self._permit_specialist_operation(issue_ids, project_id=project_id):
             return super().create_project_update(client_id, project_id, body)
 
-    def create_issue(self, client_id, team_id, title, *, description=None, project_id=None, parent_id=None):
+    def create_issue(self, client_id, team_id, title, *, description=None, project_id=None, parent_id=None,
+                     label_ids=None):
         if self.specialist_scope is not None:
             raise LinearError("Issue creation is outside specialist scope", retryable=False)
         self.viewer_id()
@@ -423,12 +424,17 @@ class BoundLinearAPI(LinearAPI):
         if parent_id:
             parent_id = self.issue(parent_id)["id"]
         return super().create_issue(client_id, team["id"], title, description=description,
-                                    project_id=project_id, parent_id=parent_id)
+                                    project_id=project_id, parent_id=parent_id, label_ids=label_ids)
 
     def issue_labels(self, issue_id):
         # Read only, for an issue this app was just handed and has already read in scope.
         with self._permit_specialist_operation():
             return super().issue_labels(issue_id)
+
+    def team_labels(self, team_id):
+        if self.specialist_scope is not None:
+            raise LinearError("Issue creation is outside specialist scope", retryable=False)
+        return super().team_labels(self._scoped_team(team_id)["id"])
 
     def team_projects(self, team_id):
         if self.specialist_scope is not None:
