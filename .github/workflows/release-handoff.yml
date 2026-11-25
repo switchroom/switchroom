@@ -117,25 +117,33 @@ jobs:
       - name: Prepare the conductor's core history repository
         # HF-851: the conductor validates Stage A against the exact Agent core and its Nous merge-base,
         # fetching both histories (2.6 GB, about 2 min) into this throwaway repository. A fresh
-        # repository (config, refs, hooks) is created every run; only its object store is cached.
+        # repository (config, hooks) is created every run; only its object store and the Nous main
+        # ref are cached. Automatic gc stays off so a detached repack cannot change the pack while
+        # the post-job cache save archives it.
         if: steps.locate.outputs.present == 'true'
         run: |
           set -euo pipefail
           core="$RUNNER_TEMP/conductor/nous-drift-core"
           mkdir -p "$core"
           git -C "$core" init -q
+          git -C "$core" config gc.auto 0
+          git -C "$core" config maintenance.auto false
           git -C "$core" remote add upstream https://github.com/NousResearch/hermes-agent.git
 
       - name: Restore the core history object store
-        # Content-addressed git objects only. The conductor still fetches the exact core commit and
-        # Nous main into it (now incremental) and checks every commit it uses. Main-branch runs are
-        # the only writers of this cache scope.
+        # Content-addressed git objects plus the last Nous main ref. Git negotiates a fetch from its
+        # refs, so objects alone still download the full history; the restored ref turns the Nous
+        # fetch into an incremental one (measured 88 s -> 1 s). The conductor force-updates that ref,
+        # fetches the exact core commit and checks every commit it uses. Main-branch runs are the
+        # only writers of this cache scope.
         if: steps.locate.outputs.present == 'true'
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: ${{ runner.temp }}/conductor/nous-drift-core/.git/objects
-          key: conductor-core-objects-${{ github.run_id }}
-          restore-keys: conductor-core-objects-
+          path: |
+            ${{ runner.temp }}/conductor/nous-drift-core/.git/objects
+            ${{ runner.temp }}/conductor/nous-drift-core/.git/refs/remotes/upstream/main
+          key: conductor-core-history-${{ github.run_id }}
+          restore-keys: conductor-core-history-
 
       - name: Commit Stage A to private main
         if: steps.locate.outputs.present == 'true'

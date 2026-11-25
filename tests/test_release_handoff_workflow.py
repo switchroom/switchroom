@@ -130,10 +130,11 @@ class ReleaseHandoffWorkflowTests(unittest.TestCase):
         self.assertNotIn("--core-commit", invocation)
         self.assertNotIn("run-all", invocation)
 
-    def test_core_history_cache_holds_only_objects_of_a_fresh_repository(self) -> None:
-        # HF-851: the conductor's 2.6 GB core history fetch is cached as an object store only; config,
-        # refs and hooks come from a fresh `git init` every run, and the conductor still fetches the
-        # exact commits it validates.
+    def test_core_history_cache_holds_only_objects_and_the_nous_ref_of_a_fresh_repository(self) -> None:
+        # HF-851: the conductor's 2.6 GB core history fetch is cached as its object store plus the
+        # Nous main ref (git negotiates from refs; objects alone still re-download everything).
+        # Config and hooks come from a fresh `git init` every run, and the conductor still fetches
+        # the exact commits it validates.
         names = re.findall(r"(?m)^      - name: (.+)$", self.text)
         prepare = names.index("Prepare the conductor's core history repository")
         restore = names.index("Restore the core history object store")
@@ -144,11 +145,25 @@ class ReleaseHandoffWorkflowTests(unittest.TestCase):
         self.assertIn('core="$RUNNER_TEMP/conductor/nous-drift-core"', init)
         self.assertIn('git -C "$core" init -q', init)
         self.assertIn('remote add upstream https://github.com/NousResearch/hermes-agent.git', init)
+        # A detached auto-gc repacked during the post-job save ("file changed as we read it").
+        self.assertIn('git -C "$core" config gc.auto 0', init)
+        self.assertIn('git -C "$core" config maintenance.auto false', init)
         cache = step(self.text, names[restore])
         self.assertIn("uses: actions/cache@", cache)
-        self.assertIn("path: ${{ runner.temp }}/conductor/nous-drift-core/.git/objects\n", cache)
-        self.assertNotIn("path: ${{ runner.temp }}/conductor/nous-drift-core\n", cache)
-        self.assertIn("key: conductor-core-objects-${{ github.run_id }}", cache)
+        paths = re.search(r"path: \|\n((?:            .+\n)+)", cache)
+        self.assertIsNotNone(paths)
+        self.assertEqual(
+            [line.strip() for line in paths.group(1).splitlines()],
+            [
+                "${{ runner.temp }}/conductor/nous-drift-core/.git/objects",
+                "${{ runner.temp }}/conductor/nous-drift-core/.git/refs/remotes/upstream/main",
+            ],
+        )
+        self.assertNotIn("nous-drift-core/.git\n", cache)
+        self.assertNotIn("nous-drift-core/.git/config", cache)
+        self.assertNotIn("nous-drift-core/.git/hooks", cache)
+        self.assertIn("key: conductor-core-history-${{ github.run_id }}", cache)
+        self.assertIn("restore-keys: conductor-core-history-\n", cache)
         self.assertIn('--workdir "$RUNNER_TEMP/conductor"', step(self.text, names[commit]))
 
     def test_least_privilege_and_no_registry_write(self) -> None:
