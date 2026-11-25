@@ -106,7 +106,7 @@ REASONS = frozenset({
     "request_refused", "service_unavailable", "context_unavailable", "unsupported_action",
     "authorization_unavailable", "native_scope_refused", "cron_scope_refused", "description_conflict",
     "context_or_service_unavailable", "delivery_uncertain", "project_required", "ambiguous_project",
-    "unknown_team", "team_required", "not_found", "ambiguous_issue", "issue_alias", "alias_closed",
+    "unknown_team", "unknown_label", "team_required", "not_found", "ambiguous_issue", "issue_alias", "alias_closed",
     # an older build's PR-acceptance closeout closed out again as Done (F28)
     "legacy_closeout",
     # work core's open-PR guard parked, resumed once that PR merges or closes (_resume_pr_park)

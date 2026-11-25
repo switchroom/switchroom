@@ -611,6 +611,12 @@ registered all leave the task in its scratch folder. One label read is made per 
 and only when the map is set. From chat, `create_issue` with `start_work` and `work_on` accept
 `repo` naming one of the mapped slugs; it wins over the labels and is refused before any write
 when it is not mapped.
+`create_issue` also accepts `labels`, a list of existing label names, so an agent can file a
+product coding issue with its product label and whoever starts it gets the worktree. Names match
+the team's and workspace's labels ignoring case (label groups are containers and do not match).
+One label read is made per labelled create. A name that matches no label, or several, refuses the
+whole create before anything is written and lists the names it could use; labels are never
+created. The readback reports `labels` in `readback_differences` if Linear stored others.
 
 Linear status follows the bound native task: queued (ready, todo, scheduled) shows Todo,
 running shows In Progress, review or a task held by the open-PR guard shows In Review,

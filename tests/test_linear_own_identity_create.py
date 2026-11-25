@@ -58,6 +58,79 @@ class OwnIdentityCreateTests(unittest.TestCase):
         created = LinearAPI(lambda: "synthetic", transport=transport).create_issue(CLIENT, "team-1", "Reconcile")
         self.assertEqual((created["id"], created["readback_differences"]), (CLIENT, ["delegate"]))
 
+    def test_issue_create_sends_label_ids_and_reads_them_back(self) -> None:
+        seen, stored = [], {}
+
+        def transport(url, body, headers):
+            payload = json.loads(body)
+            query, variables = payload["query"], payload["variables"]
+            if "issueCreate" in query:
+                seen.append(variables["input"])
+                return _ok({"issueCreate": {"success": True}})
+            if "CreatedIssue" in query:
+                self.assertIn("labels(first: 50)", query)
+                return _ok({"issue": {
+                    "id": CLIENT, "identifier": "OPS-1", "title": "Reconcile", "url": "u",
+                    "team": {"id": "team-1", "key": "OPS"}, "project": None, "parent": None,
+                    "assignee": None, "delegate": None, "labels": {"nodes": [{"id": i} for i in stored["ids"]]}}})
+            raise AssertionError(query)
+
+        api = LinearAPI(lambda: "synthetic", transport=transport)
+        stored["ids"] = ["label-1"]
+        created = api.create_issue(CLIENT, "team-1", "Reconcile", label_ids=["label-1"])
+        self.assertEqual(seen[-1]["labelIds"], ["label-1"])
+        self.assertNotIn("readback_differences", created)
+        stored["ids"] = []  # a Linear rule or person removed it: reported, never refused into a retry
+        created = api.create_issue(CLIENT, "team-1", "Reconcile", label_ids=["label-1"])
+        self.assertEqual(created["readback_differences"], ["labels"])
+
+    def test_issue_create_without_labels_sends_and_reads_none(self) -> None:
+        def transport(url, body, headers):
+            payload = json.loads(body)
+            query, variables = payload["query"], payload["variables"]
+            if "issueCreate" in query:
+                self.assertNotIn("labelIds", variables["input"])
+                return _ok({"issueCreate": {"success": True}})
+            if "CreatedIssue" in query:
+                self.assertNotIn("labels", query)
+                return _ok({"issue": {
+                    "id": CLIENT, "identifier": "OPS-1", "title": "Reconcile", "url": "u",
+                    "team": {"id": "team-1", "key": "OPS"}, "project": None, "parent": None,
+                    "assignee": None, "delegate": None}})
+            raise AssertionError(query)
+
+        for labels in (None, []):
+            with self.subTest(labels=labels):
+                created = LinearAPI(lambda: "synthetic", transport=transport).create_issue(
+                    CLIENT, "team-1", "Reconcile", label_ids=labels)
+                self.assertNotIn("readback_differences", created)
+
+    def test_bound_team_labels_read_the_scoped_team_and_skip_groups(self) -> None:
+        def transport(url, body, headers):
+            payload = json.loads(body)
+            query, variables = payload["query"], payload["variables"]
+            if "IdentityBinding" in query:
+                return _ok({"viewer": {"id": "app-a"}, "organization": {"id": "org-a"}})
+            if query.lstrip().startswith("query Team("):
+                return _ok({"team": {"id": "team-1" if variables["id"] == "OPS" else "team-other",
+                                     "key": variables["id"]}})
+            if "TeamLabels" in query:
+                self.assertEqual(variables["id"], "team-1")
+                return _ok({"team": {"id": "team-1", "labels": {"nodes": [
+                    {"id": "l-1", "name": "shop", "isGroup": False},
+                    {"id": "l-2", "name": "Area", "isGroup": True}], "pageInfo": {"hasNextPage": False}}}})
+            raise AssertionError(query)
+
+        identity = {"viewer_id": "app-a", "organization_id": "org-a", "teams": ["OPS"]}
+        client = BoundLinearAPI(lambda: "synthetic", identity=identity, transport=transport)
+        self.assertEqual(client.team_labels("OPS"), ([{"id": "l-1", "name": "shop"}], False))
+        with self.assertRaises(LinearError):
+            client.team_labels("OTHER")
+        from test_linear_specialist_authorization import SCOPE
+        scoped = BoundLinearAPI(lambda: "synthetic", identity=identity, specialist_scope=SCOPE, transport=transport)
+        with self.assertRaises(LinearError):
+            scoped.team_labels("OPS")
+
     def test_project_create_nulls_lead_and_reads_it_back(self) -> None:
         seen = []
 
