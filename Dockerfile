@@ -8,10 +8,6 @@ USER root
 ARG GH_VERSION=2.105.0
 ARG GH_LINUX_AMD64_SHA256=79e7ab5db738c48777b696e374f8b428f0647debfb424f44d2f426370407fe2f
 ARG GH_LINUX_AMD64_ASSET_ID=761188566
-ARG CLAUDE_CODE_VERSION=2.1.325
-ARG CLAUDE_AGENT_ACP_VERSION=0.112.0
-ARG CODEX_VERSION=0.172.0
-ARG GROK_VERSION=1.0.92
 ARG CLAUDE_ACP_PLUGIN_SOURCE=https://github.com/mvdbastos/hermes-acp-agents
 ARG CLAUDE_ACP_PLUGIN_REVISION=0526610a3945cc376ac517b63ca358a5b838a2fc
 ENV DISABLE_AUTOUPDATER=1
@@ -98,27 +94,6 @@ RUN /opt/hermes/.venv/bin/python /tmp/patch-honcho-sdk-floor.py /opt/hermes/plug
 # The plugin imports Agent core modules at load time; fail the bake if the parent Agent lacks one.
 COPY --chmod=0755 scripts/verify-honcho-plugin-core-seams.py /opt/hermes-fleet/bin/verify-honcho-plugin-core-seams.py
 RUN /opt/hermes/.venv/bin/python /opt/hermes-fleet/bin/verify-honcho-plugin-core-seams.py /opt/hermes/plugins/memory/honcho /opt/hermes
-COPY package.json package-lock.json /opt/coding-clis/
-RUN npm ci --omit=dev --prefix /opt/coding-clis --ignore-scripts --no-audit --no-fund \
-    && node /opt/coding-clis/node_modules/@anthropic-ai/claude-code/install.cjs \
-    && node /opt/coding-clis/node_modules/opencode-ai/postinstall.mjs \
-    && HOME=/tmp/coding-clis-build GROK_HOME=/opt/coding-clis/grok \
-         node /opt/coding-clis/node_modules/@xai-official/grok/bin/postinstall.js \
-    && ln -s /opt/coding-clis/node_modules/.bin/claude /usr/local/bin/claude \
-    && ln -s /opt/coding-clis/node_modules/.bin/claude-agent-acp /usr/local/bin/claude-agent-acp \
-    && ln -s /opt/coding-clis/node_modules/.bin/codex /usr/local/bin/codex \
-    && ln -s /opt/coding-clis/grok/bin/grok /usr/local/bin/grok \
-    && ln -s /opt/coding-clis/node_modules/.bin/opencode /usr/local/bin/opencode \
-    && test "$(/usr/local/bin/claude --version)" = "${CLAUDE_CODE_VERSION} (Claude Code)" \
-    && test "$(node -p 'require("/opt/coding-clis/node_modules/@agentclientprotocol/claude-agent-acp/package.json").version')" = "${CLAUDE_AGENT_ACP_VERSION}" \
-    && test "$(/usr/local/bin/codex --version)" = "codex-cli ${CODEX_VERSION}" \
-    && test "$(/usr/local/bin/grok --version | awk '{print $2}')" = "${GROK_VERSION}" \
-    && test -x /usr/local/bin/claude-agent-acp \
-    && test -x /usr/local/bin/codex \
-    && test -x /usr/local/bin/grok \
-    && test -x /usr/local/bin/opencode
-ENV CLAUDE_CODE_EXECUTABLE=/opt/coding-clis/node_modules/.bin/claude
-COPY --chmod=0755 scripts/claude-acp-subscription /usr/local/bin/hermes-claude-acp-subscription
 
 # Bot Desktop and browsers (HF-773). The upstream Bot Screen desktop packages (moved here from the
 # private overlay, HF-550) plus Chromium, so every agent has a screen; nothing starts at
@@ -252,6 +227,36 @@ RUN test ! -e /opt/hermes/plugins/kokoro-voice
 RUN test ! -e /opt/hermes/plugins/browser-handoff
 RUN test ! -e /opt/hermes/plugins/readonly-source
 RUN test ! -e /opt/hermes/plugins/web/perplexity
+# Coding CLIs are the most frequently bumped input, so they sit LAST among the heavy layers:
+# a CLI-only change (package.json/package-lock.json, the version ARGs) rebuilds just this layer and
+# the cheap provenance tail, while the apt desktop/Chromium, Camoufox, camofox-browser and Honcho
+# layers above stay in the BuildKit/registry cache. Layer order: base OS (Agent parent) -> pinned
+# desktop/browser runtimes -> Honcho -> pinned CLIs -> provenance stamp (HF-851).
+ARG CLAUDE_CODE_VERSION=2.1.325
+ARG CLAUDE_AGENT_ACP_VERSION=0.112.0
+ARG CODEX_VERSION=0.172.0
+ARG GROK_VERSION=1.0.92
+COPY package.json package-lock.json /opt/coding-clis/
+RUN npm ci --omit=dev --prefix /opt/coding-clis --ignore-scripts --no-audit --no-fund \
+    && node /opt/coding-clis/node_modules/@anthropic-ai/claude-code/install.cjs \
+    && node /opt/coding-clis/node_modules/opencode-ai/postinstall.mjs \
+    && HOME=/tmp/coding-clis-build GROK_HOME=/opt/coding-clis/grok \
+         node /opt/coding-clis/node_modules/@xai-official/grok/bin/postinstall.js \
+    && ln -s /opt/coding-clis/node_modules/.bin/claude /usr/local/bin/claude \
+    && ln -s /opt/coding-clis/node_modules/.bin/claude-agent-acp /usr/local/bin/claude-agent-acp \
+    && ln -s /opt/coding-clis/node_modules/.bin/codex /usr/local/bin/codex \
+    && ln -s /opt/coding-clis/grok/bin/grok /usr/local/bin/grok \
+    && ln -s /opt/coding-clis/node_modules/.bin/opencode /usr/local/bin/opencode \
+    && test "$(/usr/local/bin/claude --version)" = "${CLAUDE_CODE_VERSION} (Claude Code)" \
+    && test "$(node -p 'require("/opt/coding-clis/node_modules/@agentclientprotocol/claude-agent-acp/package.json").version')" = "${CLAUDE_AGENT_ACP_VERSION}" \
+    && test "$(/usr/local/bin/codex --version)" = "codex-cli ${CODEX_VERSION}" \
+    && test "$(/usr/local/bin/grok --version | awk '{print $2}')" = "${GROK_VERSION}" \
+    && test -x /usr/local/bin/claude-agent-acp \
+    && test -x /usr/local/bin/codex \
+    && test -x /usr/local/bin/grok \
+    && test -x /usr/local/bin/opencode
+ENV CLAUDE_CODE_EXECUTABLE=/opt/coding-clis/node_modules/.bin/claude
+COPY --chmod=0755 scripts/claude-acp-subscription /usr/local/bin/hermes-claude-acp-subscription
 COPY --chmod=0755 scripts/tooling-policy-hook /opt/hermes/bin/tooling-policy-hook
 COPY scripts/image_ref.py /opt/hermes-fleet/bin/image_ref.py
 COPY --chmod=0755 scripts/verify-agent-image-ref.py /opt/hermes-fleet/bin/verify-agent-image-ref
