@@ -116,6 +116,28 @@ jobs:
             --github-env "$GITHUB_ENV" \
             --github-output "$GITHUB_OUTPUT"
 
+      - name: Resolve content identity
+        # HF-851: the image is stamped with the tree it was built from and with a real commit of that
+        # tree. A same-repository PR that is current with main builds its head commit's tree (the
+        # merge commit's tree equals the head's), so it stamps the head SHA: the squash-merged main
+        # commit has the identical tree and main can promote these exact bytes. Otherwise the test
+        # merge commit is stamped and the image is never promoted.
+        id: identity
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          tree=$(git rev-parse 'HEAD^{tree}')
+          revision="$GITHUB_SHA"
+          if [ "$GITHUB_EVENT_NAME" = pull_request ] && [ -n "$HEAD_SHA" ]; then
+            head_tree=$(gh api "repos/$GITHUB_REPOSITORY/git/commits/$HEAD_SHA" --jq .tree.sha)
+            if [ "$head_tree" = "$tree" ]; then revision="$HEAD_SHA"; fi
+          fi
+          [[ "$tree" =~ ^[0-9a-f]{40}$ && "$revision" =~ ^[0-9a-f]{40}$ ]]
+          printf 'tree=%s\nrevision=%s\n' "$tree" "$revision" >> "$GITHUB_OUTPUT"
+          echo "content identity: tree $tree, revision $revision"
+
       - name: Log in to GHCR to pull the pinned Agent parent
         uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
         with:
@@ -233,7 +255,8 @@ jobs:
             GROK_VERSION=${{ env.GROK_VERSION }}
             CLAUDE_ACP_PLUGIN_SOURCE=${{ env.CLAUDE_ACP_PLUGIN_SOURCE }}
             CLAUDE_ACP_PLUGIN_REVISION=${{ env.CLAUDE_ACP_PLUGIN_REVISION }}
-            FLEET_GIT_SHA=${{ github.sha }}
+            FLEET_GIT_SHA=${{ steps.identity.outputs.revision }}
+            FLEET_SOURCE_TREE=${{ steps.identity.outputs.tree }}
             FLEET_IMAGE_IDENTITY=${{ env.IMAGE_REPOSITORY }}
           # BuildKit secret, mounted only for the Dockerfile's GH CLI fetch (REST asset API
           # route) and never written to a layer, build arg or provenance.
@@ -242,7 +265,8 @@ jobs:
 
       - name: Verify inherited runtime and provenance
         env:
-          EXPECTED_REVISION: ${{ github.sha }}
+          EXPECTED_REVISION: ${{ steps.identity.outputs.revision }}
+          EXPECTED_TREE: ${{ steps.identity.outputs.tree }}
           EXPECTED_IMAGE_IDENTITY: ${{ env.IMAGE_REPOSITORY }}
           EXPECTED_AGENT_IMAGE: ${{ env.AGENT_IMAGE }}
           EXPECTED_AGENT_REPOSITORY: ${{ env.AGENT_REPOSITORY }}
@@ -259,6 +283,7 @@ jobs:
           python3 scripts/verify-inherited-runtime-config.py
           docker run --rm \
             --env EXPECTED_REVISION \
+            --env EXPECTED_TREE \
             --env EXPECTED_IMAGE_IDENTITY \
             --env EXPECTED_AGENT_IMAGE \
             --env EXPECTED_AGENT_REPOSITORY \
@@ -280,6 +305,8 @@ jobs:
           assert marker["image"] == os.environ["EXPECTED_AGENT_REPOSITORY"], marker
           assert marker["version"] == metadata.version("hermes-agent"), marker
           assert fleet["revision"] == os.environ["EXPECTED_REVISION"], fleet
+          assert fleet["tree"] == os.environ["EXPECTED_TREE"], fleet
+          assert os.environ["HERMES_FLEET_SOURCE_TREE"] == os.environ["EXPECTED_TREE"]
           assert fleet["image"] == os.environ["EXPECTED_IMAGE_IDENTITY"], fleet
           assert fleet["parent_agent_image"] == os.environ["EXPECTED_AGENT_IMAGE"], fleet
           assert fleet["onepassword_cli_image"] == os.environ["EXPECTED_ONEPASSWORD_CLI_IMAGE"], fleet
@@ -391,7 +418,8 @@ jobs:
         id: stage_push
         if: >-
           github.event_name == 'pull_request' &&
-          github.event.pull_request.head.repo.full_name == github.repository
+          github.event.pull_request.head.repo.full_name == github.repository &&
+          steps.identity.outputs.revision == github.event.pull_request.head.sha
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
@@ -443,7 +471,8 @@ jobs:
 
       - name: Record staged candidate for main
         # Only reached when every gate above passed. Binds the pushed digest to the scanned config,
-        # the tree and the build inputs, and packages Trivy's layer-analysis cache.
+        # the tree, the stamped revision (the PR head) and the build inputs, and packages Trivy's
+        # layer-analysis cache with the bounded SBOM, Trivy report and VEX evaluation main promotes.
         id: stage
         if: steps.stage_push.outcome == 'success'
         continue-on-error: true
@@ -452,6 +481,7 @@ jobs:
           STAGING_IMAGE: ${{ env.IMAGE_REPOSITORY }}:fleet-pr-stage-${{ github.run_id }}-${{ github.run_attempt }}
           SCANNED_CONFIG_ID: ${{ steps.export.outputs.config-id }}
           AGENT_IMAGE: ${{ steps.agent.outputs.AGENT_IMAGE }}
+          IMAGE_REVISION: ${{ steps.identity.outputs.revision }}
         run: |
           set -euo pipefail
           python3 scripts/promote-fleet-image.py record \
@@ -464,6 +494,8 @@ jobs:
             --run-id "$GITHUB_RUN_ID" \
             --run-attempt "$GITHUB_RUN_ATTEMPT" \
             --trivy-cache-dir "$TRIVY_CACHE_DIR" \
+            --image-revision "$IMAGE_REVISION" \
+            --evidence-dir "$GITHUB_WORKSPACE" \
             --output-dir "$RUNNER_TEMP/staged"
 
       - name: Upload staged candidate record
@@ -536,14 +568,57 @@ jobs:
               ;;
           esac
 
+  promotion:
+    # HF-851: on a main push, can the merged PR's scanned image be promoted as-is? Cheap and
+    # read-only. Promotable means the merged PR's newest Fleet Image run succeeded, staged a digest
+    # for exactly this tree and is still live. Anything else (including this job failing) rebuilds.
+    needs: scope
+    if: >-
+      !cancelled() &&
+      needs.scope.outputs.image == 'true' &&
+      github.repository == 'switchroom/switchroom' &&
+      github.ref == 'refs/heads/main' &&
+      github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      promote: ${{ steps.probe.outputs.found }}
+    steps:
+      - name: Checkout exact pushed commit
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Probe for a promotable tree-identical PR stage
+        id: probe
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          python3 scripts/promote-fleet-image.py locate --probe \
+            --repository "$GITHUB_REPOSITORY" \
+            --image-repository "$IMAGE_REPOSITORY" \
+            --sha "$GITHUB_SHA" \
+            --before "$BEFORE" \
+            --trivy-cache-dir "$RUNNER_TEMP/trivy-cache" \
+            --workdir "$RUNNER_TEMP" \
+            --github-output "$GITHUB_OUTPUT"
+
   publish:
     # Every push to main that touches the image input set publishes once its exact-SHA CI run is
     # green; dispatch with publish=true re-runs it for any main commit. A push whose scope job
     # found no image inputs skips publication: the latest published digest is still the correct
-    # image for that commit (see docs/image-release.md, "Skipped publications").
-    needs: scope
+    # image for that commit (see docs/image-release.md, "Skipped publications"). A push whose
+    # merged PR staged a tree-identical scanned image is published by `promote` instead (HF-851).
+    needs: [scope, promotion]
     if: >-
       !cancelled() &&
+      needs.promotion.outputs.promote != 'true' &&
       (needs.scope.outputs.image == 'true' || needs.scope.result == 'failure') &&
       github.repository == 'switchroom/switchroom' &&
       github.ref == 'refs/heads/main' &&
@@ -572,6 +647,15 @@ jobs:
           python3 scripts/read-agent-image-manifest.py \
             --manifest release/agent-image-manifest.json \
             --github-env "$GITHUB_ENV"
+
+      - name: Resolve content identity
+        # A main rebuild stamps the main commit and its tree (HF-851).
+        id: identity
+        run: |
+          set -euo pipefail
+          tree=$(git rev-parse 'HEAD^{tree}')
+          [[ "$tree" =~ ^[0-9a-f]{40}$ ]]
+          printf 'tree=%s\n' "$tree" >> "$GITHUB_OUTPUT"
 
       - name: Log in to GHCR
         # Needed before the build to pull the pinned Agent parent; nothing is written to the
@@ -726,6 +810,7 @@ jobs:
             CLAUDE_ACP_PLUGIN_SOURCE=${{ env.CLAUDE_ACP_PLUGIN_SOURCE }}
             CLAUDE_ACP_PLUGIN_REVISION=${{ env.CLAUDE_ACP_PLUGIN_REVISION }}
             FLEET_GIT_SHA=${{ github.sha }}
+            FLEET_SOURCE_TREE=${{ steps.identity.outputs.tree }}
             FLEET_IMAGE_IDENTITY=${{ env.IMAGE_REPOSITORY }}
           secrets: |
             github_token=${{ github.token }}
@@ -752,6 +837,7 @@ jobs:
             CLAUDE_ACP_PLUGIN_SOURCE=${{ env.CLAUDE_ACP_PLUGIN_SOURCE }}
             CLAUDE_ACP_PLUGIN_REVISION=${{ env.CLAUDE_ACP_PLUGIN_REVISION }}
             FLEET_GIT_SHA=${{ github.sha }}
+            FLEET_SOURCE_TREE=${{ steps.identity.outputs.tree }}
             FLEET_IMAGE_IDENTITY=${{ env.IMAGE_REPOSITORY }}
           # BuildKit secret, mounted only for the Dockerfile's GH CLI fetch (REST asset API
           # route) and never written to a layer, build arg or provenance.
@@ -761,6 +847,7 @@ jobs:
       - name: Verify exact scanned candidate runtime and provenance
         env:
           EXPECTED_REVISION: ${{ github.sha }}
+          EXPECTED_TREE: ${{ steps.identity.outputs.tree }}
           EXPECTED_IMAGE_IDENTITY: ${{ env.IMAGE_REPOSITORY }}
           EXPECTED_AGENT_IMAGE: ${{ env.AGENT_IMAGE }}
           EXPECTED_AGENT_REPOSITORY: ${{ env.AGENT_REPOSITORY }}
@@ -777,6 +864,7 @@ jobs:
           python3 scripts/verify-inherited-runtime-config.py
           docker run --rm \
             --env EXPECTED_REVISION \
+            --env EXPECTED_TREE \
             --env EXPECTED_IMAGE_IDENTITY \
             --env EXPECTED_AGENT_IMAGE \
             --env EXPECTED_AGENT_REPOSITORY \
@@ -798,6 +886,8 @@ jobs:
           assert marker["image"] == os.environ["EXPECTED_AGENT_REPOSITORY"], marker
           assert marker["version"] == metadata.version("hermes-agent"), marker
           assert fleet["revision"] == os.environ["EXPECTED_REVISION"], fleet
+          assert fleet["tree"] == os.environ["EXPECTED_TREE"], fleet
+          assert os.environ["HERMES_FLEET_SOURCE_TREE"] == os.environ["EXPECTED_TREE"]
           assert fleet["image"] == os.environ["EXPECTED_IMAGE_IDENTITY"], fleet
           assert fleet["parent_agent_image"] == os.environ["EXPECTED_AGENT_IMAGE"], fleet
           assert fleet["onepassword_cli_image"] == os.environ["EXPECTED_ONEPASSWORD_CLI_IMAGE"], fleet
@@ -1041,6 +1131,7 @@ jobs:
             --repository "$IMAGE_REPOSITORY" \
             --revision "${{ github.sha }}" \
             --digest "${{ steps.publish.outputs.digest }}" \
+            --tree "${{ steps.identity.outputs.tree }}" \
             --agent-manifest release/agent-image-manifest.json \
             --output fleet-image-handoff.json
 
@@ -1087,6 +1178,259 @@ jobs:
         continue-on-error: true
         env:
           IMMUTABLE_REF: ${{ env.IMAGE_REPOSITORY }}@${{ steps.publish.outputs.digest }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create --prefer-index=false --tag "$BUILDCACHE_REF" "$IMMUTABLE_REF"
+
+  promote:
+    # HF-851 content-identity promotion: publish the exact digest the merged PR built, runtime-checked,
+    # smoke-tested and scanned, instead of rebuilding it. Its revision label is the PR head and its
+    # ai.switchroom.tree label is this main commit's tree (identical by construction: main requires
+    # PRs to be up to date and squash-merges them). Before the first registry write this job binds
+    # the registry config to that identity, re-runs the CRITICAL Trivy scan against today's database,
+    # re-checks VEX and waits for green exact-main CI; then it tags, attests and hands off the digest.
+    # Any failure fails the run (no silent fallback that could publish a second digest for one
+    # commit); a workflow_dispatch with publish=true rebuilds and publishes from scratch.
+    needs: [scope, promotion]
+    if: >-
+      !cancelled() &&
+      needs.promotion.outputs.promote == 'true' &&
+      github.repository == 'switchroom/switchroom' &&
+      github.ref == 'refs/heads/main' &&
+      github.event_name == 'push'
+    # Pinned like publish: imagetools and docker create behave the same as on the bake runners.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: fleet-image-publish
+    permissions:
+      contents: read
+      actions: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Checkout exact pushed commit
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Revalidate immutable Agent handoff
+        run: |
+          set -euo pipefail
+          python3 scripts/read-agent-image-manifest.py \
+            --manifest release/agent-image-manifest.json \
+            --github-env "$GITHUB_ENV"
+
+      - name: Log in to GHCR
+        # Registry reads only until the exact main CI gate below has passed.
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Install pinned Trivy
+        # Same exact release asset, size and sha256 as the bake jobs.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TRIVY_ASSET_ID: "398381981"
+          TRIVY_SIZE: "47748408"
+          TRIVY_SHA256: 8b4376d5d6befe5c24d503f10ff136d9e0c49f9127a4279fd110b727929a5aa9
+        run: |
+          set -euo pipefail
+          version="${TRIVY_VERSION#v}"
+          if [ "$version" != "0.70.0" ]; then
+            echo "TRIVY_SHA256 is pinned for 0.70.0; update it with TRIVY_VERSION" >&2
+            exit 1
+          fi
+          dir="$RUNNER_TEMP/trivy-bin"
+          mkdir -p "$dir"
+          bash scripts/fetch-pinned-release-asset.sh \
+            aquasecurity/trivy "$TRIVY_ASSET_ID" "$TRIVY_SIZE" "$TRIVY_SHA256" \
+            "https://github.com/aquasecurity/trivy/releases/download/v${version}/trivy_${version}_Linux-64bit.tar.gz" \
+            "$RUNNER_TEMP/trivy.tgz"
+          echo "${TRIVY_SHA256}  $RUNNER_TEMP/trivy.tgz" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/trivy.tgz" -C "$dir" trivy
+          echo "$dir" >> "$GITHUB_PATH"
+          echo "TRIVY_CACHE_DIR=$RUNNER_TEMP/trivy-cache" >> "$GITHUB_ENV"
+          "$dir/trivy" --version
+
+      - name: Locate the merged PR's scanned candidate and its evidence
+        # Strict form of the probe: downloads staged.json, the layer cache and the PR's scan evidence
+        # and checks every recorded hash, the tree, the stamped revision and the build inputs.
+        id: stage
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          python3 scripts/scan-fleet-image.py prefetch-db & trivy_db=$!
+          python3 scripts/promote-fleet-image.py locate \
+            --repository "$GITHUB_REPOSITORY" \
+            --image-repository "$IMAGE_REPOSITORY" \
+            --sha "$GITHUB_SHA" \
+            --before "$BEFORE" \
+            --trivy-cache-dir "$TRIVY_CACHE_DIR" \
+            --workdir "$RUNNER_TEMP" \
+            --github-output "$GITHUB_OUTPUT"
+          wait "$trivy_db"
+          grep -qx 'found=true' "$GITHUB_OUTPUT" || {
+            echo "the probe found a promotable stage but the strict locate refused it; re-run with workflow_dispatch publish=true" >&2
+            exit 1
+          }
+
+      - name: Verify the staged digest's registry config and content identity
+        env:
+          STAGED_REF: ${{ steps.stage.outputs.ref }}
+          CONFIG_DIGEST: ${{ steps.stage.outputs.config-digest }}
+          IMAGE_REVISION: ${{ steps.stage.outputs.image-revision }}
+          TREE: ${{ steps.stage.outputs.tree }}
+        run: |
+          set -euo pipefail
+          test "$TREE" = "$(git rev-parse 'HEAD^{tree}')"
+          python3 scripts/promote-fleet-image.py verify-stage \
+            --ref "$STAGED_REF" \
+            --image-repository "$IMAGE_REPOSITORY" \
+            --config-digest "$CONFIG_DIGEST" \
+            --image-revision "$IMAGE_REVISION" \
+            --tree "$TREE"
+
+      - name: Re-scan the staged digest for critical vulnerabilities
+        # Same CRITICAL fixed-only policy and pinned Trivy as the bake, against today's database.
+        # The PR's layer cache means no layer is pulled or exported.
+        env:
+          STAGED_REF: ${{ steps.stage.outputs.ref }}
+        run: |
+          set -euo pipefail
+          python3 scripts/scan-fleet-image.py trivy-remote \
+            --image "$STAGED_REF" \
+            --output trivy-image.json
+
+      - name: Revalidate scoped VEX decision before promotion
+        # The op binary comes from the digest-pinned 1Password image the candidate copied it from;
+        # the PR's VEX evaluation of the candidate's own binary must record the same hash.
+        env:
+          STAGE_DIR: ${{ steps.stage.outputs.stage-dir }}
+        run: |
+          set -euo pipefail
+          docker pull --quiet "$ONEPASSWORD_CLI_IMAGE" >/dev/null
+          container=$(docker create "$ONEPASSWORD_CLI_IMAGE")
+          docker cp "$container:/usr/local/bin/op" op-vex-publish.bin
+          docker rm "$container" >/dev/null
+          test -s op-vex-publish.bin
+          python3 scripts/verify-trivy-vex.py \
+            --trivy trivy-image.json \
+            --policy release/vex-exceptions.json \
+            --binary op-vex-publish.bin \
+            --component-image "$ONEPASSWORD_CLI_IMAGE" \
+            --output vex-publish-evaluation.json
+          python3 - "$STAGE_DIR/vex-evaluation.json" vex-publish-evaluation.json <<'PY'
+          import json, sys
+          staged, fresh = (json.load(open(path, encoding="utf-8")) for path in sys.argv[1:3])
+          for key in ("component_image", "binary_sha256"):
+              if staged.get(key) != fresh.get(key):
+                  sys.exit(f"VEX {key} of the promoted candidate {staged.get(key)!r} != {fresh.get(key)!r}")
+          PY
+
+      - name: Verify exact main CI gate
+        # Last step before the first registry write.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 scripts/verify-exact-main-ci.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --workflow "ci.yml" \
+            --sha "$GITHUB_SHA" \
+            --workflow-path ".github/workflows/ci.yml" \
+            --wait \
+            --timeout-minutes 30 \
+            --interval-seconds 15
+
+      - name: Promote the scanned PR digest to this commit
+        env:
+          STAGED_REF: ${{ steps.stage.outputs.ref }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create \
+            --prefer-index=false \
+            --tag "$IMAGE_REPOSITORY:sha-${{ github.sha }}" \
+            "$STAGED_REF"
+
+      - name: Verify promoted SHA tag resolves to the staged digest
+        env:
+          SHA_TAG: ${{ env.IMAGE_REPOSITORY }}:sha-${{ github.sha }}
+          STAGED_DIGEST: ${{ steps.stage.outputs.digest }}
+        run: |
+          set -euo pipefail
+          promoted_digest=""
+          for attempt in $(seq 1 12); do
+            promoted_digest=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$SHA_TAG" 2>/dev/null) || promoted_digest=""
+            if [ "$promoted_digest" = "$STAGED_DIGEST" ]; then
+              break
+            fi
+            printf 'attempt %s: SHA tag resolves to %s, waiting for registry\n' "$attempt" "${promoted_digest:-nothing}"
+            sleep 5
+          done
+          test -n "$promoted_digest"
+          test "$promoted_digest" = "$STAGED_DIGEST" || {
+            printf '%s\n' 'promoted SHA tag does not resolve to staged digest' >&2
+            exit 1
+          }
+
+      - name: Emit exact Fleet handoff manifest
+        run: |
+          set -euo pipefail
+          python3 scripts/emit-fleet-image-manifest.py \
+            --repository "$IMAGE_REPOSITORY" \
+            --revision "${{ github.sha }}" \
+            --digest "${{ steps.stage.outputs.digest }}" \
+            --tree "${{ steps.stage.outputs.tree }}" \
+            --image-revision "${{ steps.stage.outputs.image-revision }}" \
+            --agent-manifest release/agent-image-manifest.json \
+            --output fleet-image-handoff.json
+
+      - name: Attest published digest
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE_REPOSITORY }}
+          subject-digest: ${{ steps.stage.outputs.digest }}
+          push-to-registry: true
+
+      - name: Attest published SBOM
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-name: ${{ env.IMAGE_REPOSITORY }}
+          subject-digest: ${{ steps.stage.outputs.digest }}
+          sbom-path: ${{ steps.stage.outputs.stage-dir }}/fleet-image.attestation.spdx.json
+          push-to-registry: true
+
+      - name: Upload publication evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: fleet-image-publication-evidence-${{ github.sha }}
+          path: |
+            ${{ steps.stage.outputs.stage-dir }}/staged.json
+            ${{ steps.stage.outputs.stage-dir }}/fleet-image.attestation.spdx.json
+            ${{ steps.stage.outputs.stage-dir }}/vex-evaluation.json
+            trivy-image.json
+            vex-publish-evaluation.json
+            release/vex-exceptions.json
+          retention-days: 30
+
+      - name: Upload private House handoff manifest
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: fleet-image-handoff-${{ github.sha }}
+          path: fleet-image-handoff.json
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Move the layer-cache tag to the published digest
+        continue-on-error: true
+        env:
+          IMMUTABLE_REF: ${{ steps.stage.outputs.ref }}
         run: |
           set -euo pipefail
           docker buildx imagetools create --prefer-index=false --tag "$BUILDCACHE_REF" "$IMMUTABLE_REF"

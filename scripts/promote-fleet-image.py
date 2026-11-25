@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""Reuse a scanned pull-request Fleet bake when main publishes the same tree.
+"""Promote the scanned pull-request Fleet image when main publishes the same tree.
 
 ``main`` requires PRs to be up to date, so the tree a merged PR's
-``preflight_bake`` built and scanned is the tree the main ``publish`` job builds
-again. The image cannot simply be retagged: the last layers stamp the exact Fleet
-commit (``FLEET_GIT_SHA``: OCI revision label, environment, provenance marker),
-and a PR bake only knows its test-merge commit. Instead the PR leaves behind
-what main needs to rebuild cheaply:
+``preflight_bake`` built and scanned is the tree main publishes. Since HF-851 the
+image is stamped with content identity, not with the main commit: the PR bake
+stamps its head commit (``FLEET_GIT_SHA``, OCI revision label) and the git tree
+(``FLEET_SOURCE_TREE``, ``ai.switchroom.tree``), and the squash-merged main commit
+has exactly that tree. Main therefore promotes the exact scanned digest (retag,
+fresh Trivy/VEX gate, exact-main CI gate, attestations) instead of rebuilding it.
+The PR leaves behind what main needs:
 
 * ``start-push`` (PR, same repository only) refuses unless the checked-out merge
   commit's tree equals the PR head's tree, then tags the scanned candidate (built
@@ -17,12 +19,16 @@ what main needs to rebuild cheaply:
   layer-analysis cache (``fanal``) into one directory for upload as the
   ``fleet-image-staged-<head sha>`` artifact. The upload step runs only after every
   preflight gate has passed.
-* ``locate`` (main publish) finds the merged PR's newest successful same-repository
+* ``locate`` (main) finds the merged PR's newest successful same-repository
   Fleet Image run, requires that main's previous commit is an ancestor of the PR
   head (so the PR run's merge commit had exactly the PR head tree), that the PR
-  head tree equals the checked-out main tree, and that the recorded tree and build
-  inputs match. It then seeds Trivy's layer cache and reports the staged digest
-  for ``cache-from``.
+  head tree equals the checked-out main tree, and that the recorded tree, image
+  revision, build inputs and scan evidence match. ``--probe`` stops before the
+  download (the cheap job that chooses promotion or rebuild); the full form seeds
+  Trivy's layer cache and unpacks the staged SBOM and scan evidence.
+* ``verify-stage`` (main promotion) reads the staged digest's manifest and config
+  from the registry and requires the scanned config digest, the revision and tree
+  labels, the image identity, the Agent parent and every pinned tool version.
 
 * ``prune`` (scheduled) deletes registry versions whose every tag is a
   ``fleet-pr-stage-<run>-<attempt>`` ref and that are older than the 7-day
@@ -30,11 +36,11 @@ what main needs to rebuild cheaply:
   carrying any other tag, and untagged versions (attestations, published
   digests), are never touched.
 
-Main still builds, runtime-checks, exports, Trivy/VEX-scans, SBOMs, pushes and
-attests its own candidate; the staged image is only build cache, and the seeded
-Trivy cache only skips re-analysing layers whose content digests (diff IDs) are
-unchanged. ``locate`` never fails the job: any doubt prints why and reports
-``found=false``, and main rebuilds from scratch.
+On promotion main re-runs the CRITICAL Trivy scan against the digest with
+today's database, re-checks VEX, waits for green exact-main CI and only then
+tags and attests the digest; the runtime and Camoufox checks ran on those exact
+bytes in the PR. ``locate`` never fails the job: any doubt prints why and
+reports ``found=false``, and main rebuilds (and scans) from scratch.
 """
 from __future__ import annotations
 
@@ -52,7 +58,8 @@ import time
 from pathlib import Path
 from typing import Any, Callable, NoReturn
 
-SCHEMA_VERSION = 1
+# 2 (HF-851): content identity (image_revision = PR head, tree label) plus the PR's scan evidence.
+SCHEMA_VERSION = 2
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 PUSH_DIGEST_RE = re.compile(r"(?m)^[^\r\n]*:\s+digest:\s*(sha256:[0-9a-f]{64})\s+size:\s*\d+\s*$")
@@ -67,6 +74,25 @@ WORKFLOW_PATH = ".github/workflows/fleet-image.yml"
 MAX_AGE = dt.timedelta(hours=72)
 PRUNE_AGE = dt.timedelta(days=7)
 STAGE_TAG_RE = re.compile(r"^fleet-pr-stage-[0-9]+-[0-9]+$")
+TREE_LABEL = "ai.switchroom.tree"
+REVISION_LABEL = "org.opencontainers.image.revision"
+SOURCE_LABEL = "org.opencontainers.image.source"
+BASE_LABEL = "org.opencontainers.image.base.name"
+FLEET_SOURCE = "https://github.com/switchroom/switchroom"
+# Staged next to staged.json and bound by sha256: the bounded SBOM main attests, the PR's Trivy
+# report and its VEX evaluation (binary hash of the candidate's op).
+EVIDENCE_FILES = ("fleet-image.attestation.spdx.json", "trivy-image.json", "vex-evaluation.json")
+# Environment the Dockerfile stamps from each build input (verify-stage).
+ENV_FOR_BUILD_ARG = {
+    "AGENT_IMAGE": "HERMES_FLEET_AGENT_IMAGE",
+    "ONEPASSWORD_CLI_IMAGE": "HERMES_FLEET_ONEPASSWORD_CLI_IMAGE",
+    "CLAUDE_CODE_VERSION": "HERMES_FLEET_CLAUDE_CODE_VERSION",
+    "CLAUDE_AGENT_ACP_VERSION": "HERMES_FLEET_CLAUDE_AGENT_ACP_VERSION",
+    "CODEX_VERSION": "HERMES_FLEET_CODEX_VERSION",
+    "GROK_VERSION": "HERMES_FLEET_GROK_VERSION",
+    "CLAUDE_ACP_PLUGIN_SOURCE": "HERMES_FLEET_CLAUDE_ACP_PLUGIN_SOURCE",
+    "CLAUDE_ACP_PLUGIN_REVISION": "HERMES_FLEET_CLAUDE_ACP_PLUGIN_REVISION",
+}
 # Build inputs that live in the workflow env rather than in a tracked file. The tree
 # check already binds them (the workflow file is part of the tree); recording them
 # lets the promotion compare the values it would pass with the ones the PR used.
@@ -207,8 +233,18 @@ def record(args: argparse.Namespace) -> None:
         fanal = args.trivy_cache_dir / "fanal"
         if not fanal.is_dir():
             raise Refused(f"Trivy layer cache {fanal} does not exist")
+        head_sha = require_sha(args.head_sha, "PR head")
+        if args.image_revision != head_sha:
+            raise Refused(f"image revision {args.image_revision!r} is not the PR head {head_sha}; not promotable")
         out: Path = args.output_dir
         out.mkdir(parents=True, exist_ok=True)
+        evidence: dict[str, str] = {}
+        for name in EVIDENCE_FILES:
+            source = args.evidence_dir / name
+            if not source.is_file() or source.stat().st_size == 0:
+                raise Refused(f"scan evidence {source} is missing or empty")
+            (out / name).write_bytes(source.read_bytes())
+            evidence[name] = sha256_file(out / name)
         with tarfile.open(out / FANAL_ARCHIVE, "w:gz") as archive:
             archive.add(fanal, arcname="fanal")
         manifest = {
@@ -219,8 +255,10 @@ def record(args: argparse.Namespace) -> None:
             "immutable_ref": immutable,
             "config_digest": config_id,
             "source_sha": require_sha(args.source_sha, "built commit"),
-            "head_sha": require_sha(args.head_sha, "PR head"),
+            "head_sha": head_sha,
+            "image_revision": head_sha,
             "tree": local_tree(args.repo_root),
+            "evidence_sha256": evidence,
             "build_args": build_args_from_env(),
             "run_id": int(args.run_id),
             "run_attempt": int(args.run_attempt),
@@ -310,6 +348,14 @@ def locate(args: argparse.Namespace, *, api: Callable[[str], Any] = gh_json,
     pr_run = newest_successful_run(args.repository, head_sha, api, now)
     run_id = int(pr_run["id"])
     artifact = ARTIFACT_PREFIX + head_sha
+    if getattr(args, "probe", False):
+        listed = api(f"repos/{args.repository}/actions/runs/{run_id}/artifacts?name={artifact}&per_page=10")
+        live = [a for a in (listed or {}).get("artifacts", []) if isinstance(a, dict)
+                and a.get("name") == artifact and not a.get("expired")]
+        if len(live) != 1:
+            raise Refused(f"run {run_id} has no single live {artifact} artifact")
+        return {"found": "true", "pr": str(pr.get("number", "")), "run-url": str(pr_run.get("html_url", run_id)),
+                "head-sha": head_sha, "tree": tree}
     workdir = Path(tempfile.mkdtemp(prefix="fleet-stage-", dir=args.workdir))
     (download or gh_download)(args.repository, run_id, artifact, workdir)
     staged_path = workdir / STAGED_MANIFEST
@@ -320,6 +366,7 @@ def locate(args: argparse.Namespace, *, api: Callable[[str], Any] = gh_json,
         "schema_version": SCHEMA_VERSION,
         "repository": args.image_repository,
         "head_sha": head_sha,
+        "image_revision": head_sha,
         "tree": tree,
         "run_id": run_id,
         "build_args": build_args_from_env(),
@@ -333,6 +380,13 @@ def locate(args: argparse.Namespace, *, api: Callable[[str], Any] = gh_json,
     digest = require_digest(staged.get("digest"), "staged digest")
     if staged.get("immutable_ref") != f"{args.image_repository}@{digest}":
         raise Refused("staged immutable_ref does not match its digest")
+    config_digest = require_digest(staged.get("config_digest"), "staged config digest")
+    recorded = staged.get("evidence_sha256")
+    if not isinstance(recorded, dict) or set(recorded) != set(EVIDENCE_FILES):
+        raise Refused("staged scan evidence list does not match")
+    for name in EVIDENCE_FILES:
+        if not (workdir / name).is_file() or sha256_file(workdir / name) != recorded[name]:
+            raise Refused(f"staged {name} is missing or does not match its recorded hash")
     fanal_archive = workdir / FANAL_ARCHIVE
     if not fanal_archive.is_file() or sha256_file(fanal_archive) != staged.get("fanal_sha256"):
         raise Refused("staged Trivy cache is missing or does not match its recorded hash")
@@ -340,6 +394,11 @@ def locate(args: argparse.Namespace, *, api: Callable[[str], Any] = gh_json,
     return {
         "found": "true",
         "ref": f"{args.image_repository}@{digest}",
+        "digest": digest,
+        "config-digest": config_digest,
+        "image-revision": head_sha,
+        "tree": tree,
+        "stage-dir": str(workdir),
         "run-url": str(pr_run.get("html_url", run_id)),
         "pr": str(pr.get("number", "")),
     }
@@ -352,8 +411,11 @@ def gh_download(repository: str, run_id: int, artifact: str, dest: Path) -> None
 def locate_command(args: argparse.Namespace) -> None:
     try:
         outputs = locate(args)
-        print(f"reusing PR #{outputs['pr']} stage {outputs['ref']} from {outputs['run-url']} as build and "
-              "Trivy layer cache; main still builds, scans and attests its own candidate", flush=True)
+        if args.probe:
+            print(f"PR #{outputs['pr']} staged a tree-identical candidate in {outputs['run-url']}: promote it", flush=True)
+        else:
+            print(f"located PR #{outputs['pr']} stage {outputs['ref']} from {outputs['run-url']} (tree "
+                  f"{outputs['tree']}, revision {outputs['image-revision']})", flush=True)
     except (Refused, OSError, ValueError, KeyError, TypeError, tarfile.TarError, subprocess.TimeoutExpired) as exc:
         reason = " ".join(str(exc).split())
         outputs = {"found": "false", "reason": reason}
@@ -362,6 +424,60 @@ def locate_command(args: argparse.Namespace) -> None:
         with args.github_output.open("a", encoding="utf-8") as handle:
             for key, value in outputs.items():
                 handle.write(f"{key}={value.replace(chr(10), ' ')}\n")
+
+
+# --- main side: verify-stage ----------------------------------------------------
+
+
+def inspect_remote(docker: str, ref: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    manifest = json.loads(run([docker, "buildx", "imagetools", "inspect", "--raw", ref]))
+    config = json.loads(run([docker, "buildx", "imagetools", "inspect", "--format", "{{json .Image}}", ref]))
+    if not isinstance(manifest, dict) or not isinstance(config, dict):
+        raise Refused(f"{ref} manifest or config is not a JSON object")
+    return manifest, config
+
+
+def verify_stage(args: argparse.Namespace, *, inspect: Callable[[str, str], tuple[dict[str, Any], dict[str, Any]]] = inspect_remote) -> None:
+    ref = args.ref
+    digest = require_digest(ref.rsplit("@", 1)[1] if "@" in ref else None, "staged reference digest")
+    if ref != f"{args.image_repository}@{digest}":
+        raise Refused(f"{ref} is not an immutable {args.image_repository} digest")
+    manifest, image = inspect(args.docker, ref)
+    if manifest.get("mediaType") not in {"application/vnd.oci.image.manifest.v1+json",
+                                         "application/vnd.docker.distribution.manifest.v2+json"}:
+        raise Refused(f"{ref} is not a single-platform image manifest")
+    if (manifest.get("config") or {}).get("digest") != require_digest(args.config_digest, "scanned config"):
+        raise Refused(f"{ref} config is not the scanned config {args.config_digest}")
+    config = image.get("config") or image.get("Config") or {}
+    labels = config.get("Labels") or {}
+    env = dict(item.split("=", 1) for item in config.get("Env") or [] if isinstance(item, str) and "=" in item)
+    build_args = build_args_from_env()
+    expected_labels = {
+        REVISION_LABEL: require_sha(args.image_revision, "image revision"),
+        TREE_LABEL: require_sha(args.tree, "tree"),
+        SOURCE_LABEL: FLEET_SOURCE,
+        BASE_LABEL: build_args["AGENT_IMAGE"],
+    }
+    expected_env = {
+        "HERMES_FLEET_GIT_SHA": args.image_revision,
+        "HERMES_FLEET_SOURCE_TREE": args.tree,
+        "HERMES_FLEET_IMAGE_IDENTITY": args.image_repository,
+        **{env_name: build_args[arg] for arg, env_name in ENV_FOR_BUILD_ARG.items()},
+    }
+    wrong = sorted([k for k, v in expected_labels.items() if labels.get(k) != v]
+                   + [k for k, v in expected_env.items() if env.get(k) != v])
+    if wrong:
+        raise Refused(f"{ref} identity mismatch: {', '.join(wrong)}")
+    if config.get("User") != "1000:1000":
+        raise Refused(f"{ref} runtime user is {config.get('User')!r}, not 1000:1000")
+    print(f"verified staged {ref}: config {args.config_digest}, revision {args.image_revision}, tree {args.tree}", flush=True)
+
+
+def verify_stage_command(args: argparse.Namespace) -> None:
+    try:
+        verify_stage(args)
+    except Refused as exc:
+        fail(str(exc))
 
 
 # --- prune ------------------------------------------------------------------------
@@ -472,6 +588,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--run-id", required=True)
     p.add_argument("--run-attempt", required=True)
     p.add_argument("--trivy-cache-dir", type=Path, required=True)
+    p.add_argument("--image-revision", required=True, help="the FLEET_GIT_SHA the candidate was stamped with")
+    p.add_argument("--evidence-dir", type=Path, default=Path("."), help="directory holding the scan evidence files")
     p.add_argument("--output-dir", type=Path, required=True)
     p.add_argument("--repo-root", type=Path, default=Path("."))
     p.add_argument("--docker", default="docker")
@@ -491,7 +609,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--workdir", default=None)
     p.add_argument("--repo-root", type=Path, default=Path("."))
     p.add_argument("--github-output", type=Path, default=None)
+    p.add_argument("--probe", action="store_true", help="decide promotability only; no download")
     p.set_defaults(func=locate_command)
+
+    p = commands.add_parser("verify-stage", help="bind a staged digest's registry config to its content identity")
+    p.add_argument("--ref", required=True)
+    p.add_argument("--image-repository", required=True)
+    p.add_argument("--config-digest", required=True)
+    p.add_argument("--image-revision", required=True)
+    p.add_argument("--tree", required=True)
+    p.add_argument("--docker", default="docker")
+    p.set_defaults(func=verify_stage_command)
 
     p = commands.add_parser("prune", help="delete stage-only registry versions older than the artifact window")
     p.add_argument("--org", required=True)

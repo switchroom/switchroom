@@ -35,6 +35,8 @@ BEFORE = "b" * 40
 HEAD = "c" * 40
 TREE = "d" * 40
 DIGEST = "sha256:" + "e" * 64
+CONFIG = "sha256:" + "9" * 64
+EVIDENCE = {name: f"{name} bytes".encode() for name in promote.EVIDENCE_FILES}
 NOW = dt.datetime(2026, 11, 22, 12, tzinfo=dt.timezone.utc)
 BUILD_ENV = {name: f"value-{name}" for name in promote.BUILD_ARG_ENV}
 
@@ -65,6 +67,8 @@ class LocateTests(unittest.TestCase):
                       "run_attempt": 1}]
         self.staged_overrides: dict = {}
         self.fanal_members: dict[str, bytes] | None = None
+        self.missing_evidence: set[str] = set()
+        self.artifacts = [{"name": f"fleet-image-staged-{HEAD}", "expired": False}]
         env = mock.patch.dict(os.environ, BUILD_ENV)
         env.start()
         self.addCleanup(env.stop)
@@ -78,6 +82,9 @@ class LocateTests(unittest.TestCase):
             return {"tree": {"sha": self.head_tree}}
         if path == f"repos/{REPO}/git/commits/{MAIN}":
             return {"parents": [{"sha": BEFORE}]}
+        if path.startswith(f"repos/{REPO}/actions/runs/99/artifacts?"):
+            self.assertIn(f"name=fleet-image-staged-{HEAD}", path)
+            return {"artifacts": self.artifacts}
         if path.startswith(f"repos/{REPO}/actions/workflows/{promote.WORKFLOW}/runs?"):
             self.assertIn(f"head_sha={HEAD}", path)
             self.assertIn("event=pull_request", path)
@@ -87,24 +94,60 @@ class LocateTests(unittest.TestCase):
     def download(self, repository: str, run_id: int, artifact: str, dest: Path) -> None:
         self.assertEqual((repository, run_id, artifact), (REPO, 99, f"fleet-image-staged-{HEAD}"))
         sha = fanal_archive(dest / promote.FANAL_ARCHIVE, self.fanal_members)
-        staged = {"schema_version": 1, "repository": IMAGE, "head_sha": HEAD, "tree": TREE, "run_id": 99,
-                  "run_attempt": 1,
+        for name, data in EVIDENCE.items():
+            if name not in self.missing_evidence:
+                (dest / name).write_bytes(data)
+        staged = {"schema_version": 2, "repository": IMAGE, "head_sha": HEAD, "image_revision": HEAD, "tree": TREE,
+                  "run_id": 99, "run_attempt": 1, "config_digest": CONFIG,
                   "build_args": BUILD_ENV, "digest": DIGEST, "immutable_ref": f"{IMAGE}@{DIGEST}",
+                  "evidence_sha256": {name: hashlib.sha256(data).hexdigest() for name, data in EVIDENCE.items()},
                   "fanal_sha256": sha, **self.staged_overrides}
         (dest / promote.STAGED_MANIFEST).write_text(json.dumps(staged), encoding="utf-8")
 
-    def args(self, before: str = BEFORE) -> argparse.Namespace:
+    def args(self, before: str = BEFORE, probe: bool = False) -> argparse.Namespace:
         return argparse.Namespace(repository=REPO, image_repository=IMAGE, sha=MAIN, before=before, tree=TREE,
-                                  trivy_cache_dir=self.cache, workdir=str(self.work), repo_root=ROOT)
+                                  trivy_cache_dir=self.cache, workdir=str(self.work), repo_root=ROOT, probe=probe)
 
-    def locate(self, before: str = BEFORE):
-        return promote.locate(self.args(before), api=self.api, download=self.download, now=NOW)
+    def locate(self, before: str = BEFORE, probe: bool = False):
+        return promote.locate(self.args(before, probe), api=self.api, download=self.download, now=NOW)
 
     def test_verified_stage_is_reused_and_seeds_trivy_layer_cache(self) -> None:
         outputs = self.locate()
         self.assertEqual(outputs["found"], "true")
         self.assertEqual(outputs["ref"], f"{IMAGE}@{DIGEST}")
+        self.assertEqual((outputs["digest"], outputs["config-digest"]), (DIGEST, CONFIG))
+        self.assertEqual((outputs["image-revision"], outputs["tree"]), (HEAD, TREE))
+        stage = Path(outputs["stage-dir"])
+        for name, data in EVIDENCE.items():
+            self.assertEqual((stage / name).read_bytes(), data)
         self.assertEqual((self.cache / "fanal/fanal.db").read_bytes(), b"bolt")
+
+    def test_probe_decides_without_downloading(self) -> None:
+        def no_download(*_args):
+            raise AssertionError("probe must not download")
+        outputs = promote.locate(self.args(probe=True), api=self.api, download=no_download, now=NOW)
+        self.assertEqual((outputs["found"], outputs["head-sha"], outputs["tree"]), ("true", HEAD, TREE))
+        for artifacts in ([], [{"name": f"fleet-image-staged-{HEAD}", "expired": True}],
+                          [{"name": f"fleet-image-staged-{HEAD}", "expired": False}] * 2):
+            with self.subTest(artifacts=artifacts):
+                self.artifacts = artifacts
+                with self.assertRaisesRegex(promote.Refused, "artifact"):
+                    promote.locate(self.args(probe=True), api=self.api, download=no_download, now=NOW)
+        self.artifacts = [{"name": f"fleet-image-staged-{HEAD}", "expired": False}]
+        self.head_tree = "f" * 40
+        with self.assertRaisesRegex(promote.Refused, "tree"):
+            promote.locate(self.args(probe=True), api=self.api, download=no_download, now=NOW)
+
+    def test_refuses_missing_or_altered_scan_evidence(self) -> None:
+        for name in promote.EVIDENCE_FILES:
+            with self.subTest(missing=name):
+                self.missing_evidence = {name}
+                self.refuses(name)
+        self.missing_evidence = set()
+        self.staged_overrides = {"evidence_sha256": {name: "0" * 64 for name in EVIDENCE}}
+        self.refuses("does not match its recorded hash")
+        self.staged_overrides = {"evidence_sha256": {}}
+        self.refuses("evidence list")
 
     def test_dispatch_without_before_uses_first_parent(self) -> None:
         self.assertEqual(self.locate(before="")["found"], "true")
@@ -160,7 +203,9 @@ class LocateTests(unittest.TestCase):
             {"run_attempt": 2},
             {"repository": "ghcr.io/other/image"},
             {"build_args": {**BUILD_ENV, "CODEX_VERSION": "0.0.1"}},
-            {"schema_version": 2},
+            {"schema_version": 1},
+            {"image_revision": MAIN},
+            {"config_digest": "latest"},
             {"immutable_ref": f"{IMAGE}@sha256:{'0' * 64}"},
             {"digest": "latest"},
             {"fanal_sha256": "0" * 64},
@@ -332,6 +377,96 @@ class StartPushTests(unittest.TestCase):
             record = argparse.Namespace(state=state, timeout_seconds=1, poll_seconds=0.1)
             with self.assertRaises(SystemExit):
                 promote.record(record)
+
+
+class RecordTests(unittest.TestCase):
+    def test_record_binds_head_revision_and_scan_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state, out, evidence, cache = root / "state", root / "out", root / "evidence", root / "trivy"
+            state.mkdir(); evidence.mkdir(); (cache / "fanal").mkdir(parents=True)
+            (cache / "fanal" / "fanal.db").write_bytes(b"bolt")
+            (state / promote.STATUS_FILE).write_text("0\n")
+            (state / promote.LOG_FILE).write_text(f"stage: digest: {DIGEST} size: 1\n")
+            for name, data in EVIDENCE.items():
+                (evidence / name).write_bytes(data)
+            args = argparse.Namespace(state=state, timeout_seconds=1, poll_seconds=0.1, config_id=CONFIG,
+                                      repository=IMAGE, docker="docker", trivy_cache_dir=cache, output_dir=out,
+                                      staging_image=f"{IMAGE}:fleet-pr-stage-1-1", source_sha=MAIN, head_sha=HEAD,
+                                      image_revision=HEAD, evidence_dir=evidence, run_id="5", run_attempt="1",
+                                      repo_root=ROOT)
+            with mock.patch.dict(os.environ, BUILD_ENV), mock.patch.object(promote, "remote_config_digest", return_value=CONFIG), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                promote.record(args)
+            staged = json.loads((out / promote.STAGED_MANIFEST).read_text())
+            self.assertEqual((staged["schema_version"], staged["image_revision"], staged["head_sha"]), (2, HEAD, HEAD))
+            self.assertEqual(staged["evidence_sha256"], {n: hashlib.sha256(d).hexdigest() for n, d in EVIDENCE.items()})
+            for name, data in EVIDENCE.items():
+                self.assertEqual((out / name).read_bytes(), data)
+            # A candidate stamped with anything but the PR head is never staged for promotion.
+            args.image_revision, args.output_dir = MAIN, root / "out2"
+            with mock.patch.dict(os.environ, BUILD_ENV), mock.patch.object(promote, "remote_config_digest", return_value=CONFIG), \
+                    contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                promote.record(args)
+            args.image_revision = HEAD
+            (evidence / "vex-evaluation.json").unlink()
+            with mock.patch.dict(os.environ, BUILD_ENV), mock.patch.object(promote, "remote_config_digest", return_value=CONFIG), \
+                    contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                promote.record(args)
+
+
+class VerifyStageTests(unittest.TestCase):
+    def setUp(self) -> None:
+        env = mock.patch.dict(os.environ, BUILD_ENV)
+        env.start()
+        self.addCleanup(env.stop)
+        self.labels = {promote.REVISION_LABEL: HEAD, promote.TREE_LABEL: TREE, promote.SOURCE_LABEL: promote.FLEET_SOURCE,
+                       promote.BASE_LABEL: BUILD_ENV["AGENT_IMAGE"]}
+        self.env = {"HERMES_FLEET_GIT_SHA": HEAD, "HERMES_FLEET_SOURCE_TREE": TREE, "HERMES_FLEET_IMAGE_IDENTITY": IMAGE,
+                    **{env: BUILD_ENV[arg] for arg, env in promote.ENV_FOR_BUILD_ARG.items()}}
+        self.manifest = {"mediaType": "application/vnd.docker.distribution.manifest.v2+json", "config": {"digest": CONFIG}}
+        self.user = "1000:1000"
+
+    def verify(self, ref: str = f"{IMAGE}@{DIGEST}") -> None:
+        config = {"config": {"Labels": self.labels, "Env": [f"{k}={v}" for k, v in self.env.items()], "User": self.user}}
+        args = argparse.Namespace(ref=ref, image_repository=IMAGE, config_digest=CONFIG, image_revision=HEAD, tree=TREE,
+                                  docker="docker")
+        with contextlib.redirect_stdout(io.StringIO()):
+            promote.verify_stage(args, inspect=lambda _docker, _ref: (self.manifest, config))
+
+    def test_accepts_the_exact_content_identity(self) -> None:
+        self.verify()
+
+    def test_rejects_any_identity_drift(self) -> None:
+        cases = (
+            ("labels", promote.REVISION_LABEL, MAIN),
+            ("labels", promote.TREE_LABEL, "f" * 40),
+            ("labels", promote.BASE_LABEL, "ghcr.io/x/y@sha256:" + "0" * 64),
+            ("env", "HERMES_FLEET_CLAUDE_CODE_VERSION", "0.0.0"),
+            ("env", "HERMES_FLEET_SOURCE_TREE", "development"),
+            ("env", "HERMES_FLEET_IMAGE_IDENTITY", "local/hermes-fleet"),
+        )
+        for where, key, value in cases:
+            with self.subTest(key=key):
+                original = dict(getattr(self, where))
+                getattr(self, where)[key] = value
+                with self.assertRaisesRegex(promote.Refused, key):
+                    self.verify()
+                setattr(self, where, original)
+        self.manifest = {**self.manifest, "config": {"digest": "sha256:" + "1" * 64}}
+        with self.assertRaisesRegex(promote.Refused, "scanned config"):
+            self.verify()
+        self.manifest = {"mediaType": "application/vnd.oci.image.index.v1+json", "config": {"digest": CONFIG}}
+        with self.assertRaisesRegex(promote.Refused, "single-platform"):
+            self.verify()
+        self.manifest = {"mediaType": "application/vnd.oci.image.manifest.v1+json", "config": {"digest": CONFIG}}
+        self.user = "root"
+        with self.assertRaisesRegex(promote.Refused, "1000:1000"):
+            self.verify()
+        self.user = "1000:1000"
+        for ref in (f"{IMAGE}:sha-{MAIN}", f"ghcr.io/other/image@{DIGEST}"):
+            with self.subTest(ref=ref), self.assertRaises(promote.Refused):
+                self.verify(ref)
 
 
 class WorkflowWiringTests(unittest.TestCase):

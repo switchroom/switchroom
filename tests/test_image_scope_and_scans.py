@@ -150,7 +150,7 @@ class ScopedWorkflowTests(unittest.TestCase):
         cls.jobs = yaml.safe_load(cls.text)["jobs"]
 
     def test_scope_job_is_cheap_read_only_and_first(self):
-        self.assertEqual(list(self.jobs), ["scope", "preflight_bake", "preflight", "publish"])
+        self.assertEqual(list(self.jobs), ["scope", "preflight_bake", "preflight", "promotion", "publish", "promote"])
         scope = self.jobs["scope"]
         self.assertEqual(scope["permissions"], {"contents": "read"})
         self.assertNotIn("environment", scope)
@@ -166,7 +166,7 @@ class ScopedWorkflowTests(unittest.TestCase):
         for name in ("preflight_bake", "publish"):
             with self.subTest(job=name):
                 job = self.jobs[name]
-                self.assertEqual(job["needs"], "scope")
+                self.assertEqual(job["needs"], "scope" if name == "preflight_bake" else ["scope", "promotion"])
                 condition = job["if"]
                 self.assertTrue(condition.startswith("!cancelled() &&"), condition)
                 self.assertIn("(needs.scope.outputs.image == 'true' || needs.scope.result == 'failure')", condition)
@@ -220,9 +220,10 @@ class ScopedWorkflowTests(unittest.TestCase):
                 self.assertEqual(result.returncode == 0, expected, result.stdout + result.stderr)
 
     def test_workflow_conditions_preserve_trusted_event_boundaries(self):
-        def applies(job, *, event, publish, scope_result, image, cancelled=False):
+        def applies(job, *, event, publish, scope_result, image, cancelled=False, promote=""):
             condition = self.jobs[job]["if"]
             values = {
+                "needs.promotion.outputs.promote": promote,
                 "needs.scope.outputs.image": image,
                 "needs.scope.result": scope_result,
                 "github.event.inputs.publish": publish,
@@ -254,6 +255,60 @@ class ScopedWorkflowTests(unittest.TestCase):
                 actual = tuple(applies(job, event=event, publish=publish, scope_result=scope_result, image=image)
                                for job in ("preflight_bake", "preflight", "publish"))
                 self.assertEqual(actual, expected)
+                # HF-851: promote never runs without a promotable stage, so the table above is unchanged.
+                self.assertFalse(applies("promote", event=event, publish=publish, scope_result=scope_result, image=image))
+
+    def test_promotion_replaces_publish_only_on_a_main_push_with_a_promotable_stage(self):
+        def applies(job, *, event, image, promote, scope_result="success", publish=""):
+            condition = self.jobs[job]["if"]
+            values = {
+                "needs.promotion.outputs.promote": promote,
+                "needs.scope.outputs.image": image,
+                "needs.scope.result": scope_result,
+                "github.event.inputs.publish": publish,
+                "github.event_name": event,
+                "github.repository": "switchroom/switchroom",
+                "github.ref": "refs/heads/main",
+            }
+            condition = condition.replace("!cancelled()", "True")
+            for reference in sorted(values, key=len, reverse=True):
+                condition = condition.replace(reference, repr(values[reference]))
+            condition = condition.replace("&&", " and ").replace("||", " or ")
+            return bool(eval(condition, {"__builtins__": {}}, {}))
+
+        self.assertTrue(applies("promotion", event="push", image="true", promote=""))
+        self.assertFalse(applies("promotion", event="push", image="false", promote=""))
+        self.assertFalse(applies("promotion", event="workflow_dispatch", image="true", promote="", publish="true"))
+        self.assertFalse(applies("promotion", event="pull_request", image="true", promote=""))
+        for promote, publishes, promotes in (("true", False, True), ("false", True, False), ("", True, False)):
+            with self.subTest(promote=promote):
+                self.assertEqual(applies("publish", event="push", image="true", promote=promote), publishes)
+                self.assertEqual(applies("promote", event="push", image="true", promote=promote), promotes)
+        # A dispatch with publish=true always rebuilds, never promotes.
+        self.assertTrue(applies("publish", event="workflow_dispatch", image="true", promote="", publish="true"))
+        self.assertFalse(applies("promote", event="workflow_dispatch", image="true", promote="true", publish="true"))
+        self.assertEqual(self.jobs["promotion"]["permissions"], {"contents": "read", "actions": "read"})
+        self.assertNotIn("environment", self.jobs["promotion"])
+        self.assertEqual(self.jobs["promote"]["environment"], "fleet-image-publish")
+
+    def test_promote_gates_every_registry_write_behind_identity_scan_vex_and_exact_ci(self):
+        names = [step["name"] for step in self.jobs["promote"]["steps"]]
+        gate = names.index("Verify exact main CI gate")
+        for before in ("Locate the merged PR's scanned candidate and its evidence",
+                       "Verify the staged digest's registry config and content identity",
+                       "Re-scan the staged digest for critical vulnerabilities",
+                       "Revalidate scoped VEX decision before promotion"):
+            self.assertLess(names.index(before), gate, before)
+        for after in ("Promote the scanned PR digest to this commit", "Verify promoted SHA tag resolves to the staged digest",
+                      "Emit exact Fleet handoff manifest", "Attest published digest", "Attest published SBOM",
+                      "Upload private House handoff manifest", "Move the layer-cache tag to the published digest"):
+            self.assertGreater(names.index(after), gate, after)
+        text = json.dumps(self.jobs["promote"])
+        self.assertNotIn("docker push", text)
+        self.assertNotIn("build-push-action", text)
+        self.assertIn("--prefer-index=false", text)
+        self.assertIn('--image-revision \\"${{ steps.stage.outputs.image-revision }}\\"', text)
+        self.assertIn('--tree \\"${{ steps.stage.outputs.tree }}\\"', text)
 
 
 class ScanHelperTests(unittest.TestCase):
