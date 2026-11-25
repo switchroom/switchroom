@@ -227,7 +227,7 @@ RUN test ! -e /opt/hermes/plugins/kokoro-voice
 RUN test ! -e /opt/hermes/plugins/browser-handoff
 RUN test ! -e /opt/hermes/plugins/readonly-source
 RUN test ! -e /opt/hermes/plugins/web/perplexity
-# Coding CLIs are the most frequently bumped input, so they sit LAST among the heavy layers:
+# The coding CLIs are the most frequently bumped input, so they sit LAST among the heavy layers:
 # a CLI-only change (package.json/package-lock.json, the version ARGs) rebuilds just this layer and
 # the cheap provenance tail, while the apt desktop/Chromium, Camoufox, camofox-browser and Honcho
 # layers above stay in the BuildKit/registry cache. Layer order: base OS (Agent parent) -> pinned
