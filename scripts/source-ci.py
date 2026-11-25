@@ -77,7 +77,7 @@ SHARED_TESTS = {
     'test_linear_origin_provider_native.py', 'test_linear_plugin.py',
     'test_linear_scope_effect_scenarios.py', 'test_linear_specialist_authorization.py',
     'test_linear_status_follows_work_scenarios.py',
-    'test_claude_acp_connector_hydration.py',
+    'test_claude_acp_connector_hydration.py', 'test_linear_ci_wait_scenarios.py',
 }
 
 
