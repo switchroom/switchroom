@@ -1,0 +1,109 @@
+name: CLI bump bot
+
+# HF-851: keeps the bundled CLIs on their stable channels. Daily (and on demand) it runs scripts/cli-bump.py and opens one
+# PR per group. Non-Claude bumps (codex, grok, opencode, gh, op) get auto-merge armed: GitHub merges only when every required
+# check is green. Claude Code / claude-agent-acp bumps open a PR labelled needs-native-tool-review and are NEVER auto-merged or
+# approved: the native-tool deny review (claude-acp-stack-upgrade) is a human step and the reviewed-version gate stays red
+# until it is done. The PR is created with the release bot App token because a PR opened with GITHUB_TOKEN does not run CI.
+
+on:
+  schedule:
+    - cron: "17 20 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: cli-bump
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    name: Bump ${{ matrix.group }} CLIs
+    if: github.repository == 'switchroom/switchroom'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions: {}
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [auto, review]
+    steps:
+      - name: Mint a release bot token scoped to switchroom/switchroom
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+          owner: switchroom
+          repositories: switchroom
+          permission-contents: write
+          permission-pull-requests: write
+          permission-workflows: write
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Look for newer stable releases
+        id: check
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -uo pipefail
+          python3 scripts/cli-bump.py check --group "${{ matrix.group }}" > "$RUNNER_TEMP/check.json"
+          rc=$?
+          cat "$RUNNER_TEMP/check.json"
+          case "$rc" in
+            0) echo "changes=true" >> "$GITHUB_OUTPUT" ;;
+            3) echo "changes=false" >> "$GITHUB_OUTPUT" ;;
+            *) exit "$rc" ;;
+          esac
+
+      - name: Apply pins and refresh the lockfile
+        if: steps.check.outputs.changes == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          python3 scripts/cli-bump.py apply --group "${{ matrix.group }}" --body-file "$RUNNER_TEMP/body.md"
+          npm install --package-lock-only --ignore-scripts --no-audit --no-fund
+          git diff --stat
+
+      - name: Open or update the PR
+        if: steps.check.outputs.changes == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GROUP: ${{ matrix.group }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          branch="cli-bump/${GROUP}"
+          summary="$(python3 - <<'PY'
+          import json, os
+          data = json.load(open(os.environ["RUNNER_TEMP"] + "/check.json"))
+          print(", ".join(f"{c['tool']} {c['to']}" for c in data["changes"]))
+          PY
+          )"
+          git config user.name "hermes-release-bot[bot]"
+          git config user.email "hermes-release-bot[bot]@users.noreply.github.com"
+          git checkout -B "$branch"
+          git add -A
+          git commit -q -m "Bump bundled CLIs: ${summary}" -m "Automated by .github/workflows/cli-bump.yml (HF-851)."
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git"
+          git push --force-with-lease origin "$branch"
+          label=needs-native-tool-review
+          [ "$GROUP" = auto ] && label=cli-bump-auto
+          gh label create "$label" -R "$REPO" --color BFD4F2 --description "CLI bump bot" 2>/dev/null || true
+          existing="$(gh pr list -R "$REPO" --head "$branch" --state open --json number --jq '.[0].number // empty')"
+          if [ -n "$existing" ]; then
+            gh pr edit "$existing" -R "$REPO" --title "Bump bundled CLIs: ${summary}" --body-file "$RUNNER_TEMP/body.md"
+            pr="$existing"
+          else
+            url="$(gh pr create -R "$REPO" --base main --head "$branch" --title "Bump bundled CLIs: ${summary}" --body-file "$RUNNER_TEMP/body.md" --label "$label")"
+            pr="${url##*/}"
+          fi
+          if [ "$GROUP" = auto ]; then
+            gh pr merge "$pr" -R "$REPO" --auto --squash
+          fi
