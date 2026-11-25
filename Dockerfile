@@ -228,7 +228,7 @@ RUN test ! -e /opt/hermes/plugins/browser-handoff
 RUN test ! -e /opt/hermes/plugins/readonly-source
 RUN test ! -e /opt/hermes/plugins/web/perplexity
 # The coding CLIs change most often, so they sit LAST among the heavy layers:
-# a CLI-only change (package.json/package-lock.json, the version ARGs) rebuilds just this layer and
+# a CLI-only change (package.json/package-lock.json or the version ARGs) rebuilds just this layer and
 # the cheap provenance tail, while the apt desktop/Chromium, Camoufox, camofox-browser and Honcho
 # layers above stay in the BuildKit/registry cache. Layer order: base OS (Agent parent) -> pinned
 # desktop/browser runtimes -> Honcho -> pinned CLIs -> provenance stamp (HF-851). Main promotes
