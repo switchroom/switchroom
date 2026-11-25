@@ -144,10 +144,11 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn('git ls-remote origin "refs/heads/$branch"', self.text)
         self.assertIn('--force-with-lease="refs/heads/$branch:${remote_head}"', self.text)
 
-    def test_token_can_read_required_checks_but_writes_only_what_it_needs(self):
+    def test_token_requests_only_scopes_the_installation_grants(self):
+        # Asking for any scope the release bot installation lacks fails the token mint (422). checks/statuses/actions
+        # read were tried and are not granted.
         perms = dict(re.findall(r"permission-([a-z-]+): (read|write)", self.text))
-        self.assertEqual(perms, {"contents": "write", "pull-requests": "write", "workflows": "write",
-                                 "checks": "read", "statuses": "read", "actions": "read"})
+        self.assertEqual(perms, {"contents": "write", "pull-requests": "write", "workflows": "write"})
 
     def test_actions_are_pinned_to_commits(self):
         for use in re.findall(r"(?m)^\s*(?:- )?uses: (\S+)", self.text):
