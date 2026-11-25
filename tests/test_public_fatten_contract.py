@@ -22,7 +22,7 @@ HONCHO_AI_VERSION = "2.9.0"
 EXTRA_CLIS = {
     "@openai/codex": "0.172.0",
     "@xai-official/grok": "1.0.92",
-    "opencode-ai": "1.19.5",
+    "opencode-ai": "1.19.6",
 }
 
 
