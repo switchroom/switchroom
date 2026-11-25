@@ -44,7 +44,8 @@ class ConnectorHydrationTests(unittest.TestCase):
                    "SearchMcpRegistry", "SendFile", "SendUserFile", "SuggestConnectors",
                    "WaitForMcpServers", "SubscribePR", "SendToProject", "SendToProjectContext",
             "ReadWidgetContext", "WrapUp", "CrossSessionMessage",
-                   "PlaceHookTranscript", "ReadSessionRepo", "RunModFs"}
+                   "PlaceHookTranscript", "ReadSessionRepo", "RunModFs",
+                   "GetGoal", "SetGoal", "PauseGoal", "RunModFsRange", "WorkspaceDiffForRemote"}
         with tempfile.TemporaryDirectory() as tmp:
             options = client.claude_code_session_options(set(), tmp)
         self.assertEqual(
@@ -90,7 +91,7 @@ class ConnectorHydrationTests(unittest.TestCase):
             package = Path(tmp, "package.json")
             executable = Path(tmp, "claude")
             sdk_tools = Path(tmp, "sdk-tools.d.ts")
-            executable.write_text("#!/bin/sh\nprintf '2.1.325 (Claude Code)\\n'\n", encoding="utf-8")
+            executable.write_text("#!/bin/sh\nprintf '2.1.326 (Claude Code)\\n'\n", encoding="utf-8")
             sdk_tools.write_text("export type ToolInputSchemas = BashInput;\n", encoding="utf-8")
             os.chmod(executable, 0o700)
             executable_sha256 = hashlib.sha256(executable.read_bytes()).hexdigest()
@@ -103,20 +104,20 @@ class ConnectorHydrationTests(unittest.TestCase):
                     executable_sha256=executable_sha256,
                     sdk_tools_sha256=sdk_tools_sha256,
                 )
-            package.write_text(json.dumps({"version": "2.1.325"}), encoding="utf-8")
-            self.assertEqual(verify(), "2.1.325")
+            package.write_text(json.dumps({"version": "2.1.326"}), encoding="utf-8")
+            self.assertEqual(verify(), "2.1.326")
 
             package.write_text(json.dumps({"version": "2.1.279"}), encoding="utf-8")
             with self.assertRaisesRegex(RuntimeError, "review the native tool deny set"):
                 verify()
 
-            package.write_text(json.dumps({"version": "2.1.325"}), encoding="utf-8")
+            package.write_text(json.dumps({"version": "2.1.326"}), encoding="utf-8")
             executable.write_text("#!/bin/sh\nprintf '2.1.279 (Claude Code)\\n'\n", encoding="utf-8")
             executable_sha256 = hashlib.sha256(executable.read_bytes()).hexdigest()
             with self.assertRaisesRegex(RuntimeError, "launched Claude Code executable"):
                 verify()
 
-            executable.write_text("#!/bin/sh\nprintf '2.1.325 (Claude Code)\\n'\n# drift\n", encoding="utf-8")
+            executable.write_text("#!/bin/sh\nprintf '2.1.326 (Claude Code)\\n'\n# drift\n", encoding="utf-8")
             with self.assertRaisesRegex(RuntimeError, "artifact hash mismatch"):
                 verify()
 
@@ -188,6 +189,7 @@ class ConnectorHydrationTests(unittest.TestCase):
             "WaitForMcpServers", "SubscribePR", "SendToProject", "SendToProjectContext",
             "ReadWidgetContext", "WrapUp", "CrossSessionMessage",
             "PlaceHookTranscript", "ReadSessionRepo", "RunModFs",
+            "GetGoal", "SetGoal", "PauseGoal", "RunModFsRange", "WorkspaceDiffForRemote",
         }
         self.assertEqual(set(denied[:-1]), expected_native)
         self.assertEqual(denied[-1], "mcp__claude_ai_Slack__write_*")
