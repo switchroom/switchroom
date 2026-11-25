@@ -186,7 +186,7 @@ class FleetImageReleaseTests(unittest.TestCase):
                 "@anthropic-ai/claude-code": CLAUDE_CODE_VERSION,
                 "@openai/codex": CODEX_VERSION,
                 "@xai-official/grok": GROK_VERSION,
-                "opencode-ai": "1.19.6",
+                "opencode-ai": "1.19.5",
             },
         )
         self.assertTrue(package["private"])
