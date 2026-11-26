@@ -345,7 +345,7 @@ jobs:
           assert pathlib.Path("/usr/local/bin/hermes-claude-acp-subscription").is_file()
           assert pathlib.Path("/opt/hermes/bin/tooling-policy-hook").is_file()
           assert pwd.getpwnam("hermes").pw_uid == 1000
-          assert subprocess.check_output(["gh", "--version"], text=True).split()[2] == "2.105.0"
+          assert subprocess.check_output(["gh", "--version"], text=True).split()[2] == "2.106.0"
           assert metadata.version("honcho-ai") == "2.9.0"
           subprocess.check_call(["/opt/hermes/.venv/bin/python", "/opt/hermes-fleet/bin/verify-honcho-runtime.py"])
           subprocess.check_call(["/opt/hermes/.venv/bin/python", "/opt/hermes-fleet/bin/verify-honcho-plugin-core-seams.py", "/opt/hermes/plugins/memory/honcho", "/opt/hermes"])
@@ -926,7 +926,7 @@ jobs:
           assert pathlib.Path("/usr/local/bin/hermes-claude-acp-subscription").is_file()
           assert pathlib.Path("/opt/hermes/bin/tooling-policy-hook").is_file()
           assert pwd.getpwnam("hermes").pw_uid == 1000
-          assert subprocess.check_output(["gh", "--version"], text=True).split()[2] == "2.105.0"
+          assert subprocess.check_output(["gh", "--version"], text=True).split()[2] == "2.106.0"
           assert metadata.version("honcho-ai") == "2.9.0"
           subprocess.check_call(["/opt/hermes/.venv/bin/python", "/opt/hermes-fleet/bin/verify-honcho-runtime.py"])
           subprocess.check_call(["/opt/hermes/.venv/bin/python", "/opt/hermes-fleet/bin/verify-honcho-plugin-core-seams.py", "/opt/hermes/plugins/memory/honcho", "/opt/hermes"])
