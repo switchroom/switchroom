@@ -14,9 +14,9 @@ PLUGINS_CONTRACT = ROOT / "contracts" / "plugins.json"
 SCOPE = ROOT / "scripts" / "fleet-image-change-scope.py"
 VERIFY = ROOT / "scripts" / "verify-public-tree.py"
 WORKFLOW = ROOT / ".github" / "workflows" / "fleet-image.yml"
-GH_VERSION = "2.105.0"
+GH_VERSION = "2.106.0"
 GH_LINUX_AMD64_SHA256 = (
-    "79e7ab5db738c48777b696e374f8b428f0647debfb424f44d2f426370407fe2f"
+    "a476449fa9625413c54a3734eded62e9e480e49f421ff08e7f3b3879c059a033"
 )
 HONCHO_AI_VERSION = "2.9.0"
 EXTRA_CLIS = {
@@ -43,7 +43,7 @@ class PublicFattenContractTests(unittest.TestCase):
         self.assertIn("curl -fsSL", text)
         # REST asset API first, release URL second; the pinned sha256 decides whether the
         # API route counts and is checked again unconditionally after either route.
-        self.assertIn("ARG GH_LINUX_AMD64_ASSET_ID=761188566", text)
+        self.assertIn("ARG GH_LINUX_AMD64_ASSET_ID=793444853", text)
         self.assertIn("https://api.github.com/repos/cli/cli/releases/assets/${GH_LINUX_AMD64_ASSET_ID}", text)
         self.assertLess(text.index("api.github.com/repos/cli/cli"), text.index("github.com/cli/cli/releases/download"))
         self.assertEqual(text.count('"${GH_LINUX_AMD64_SHA256}" "/tmp/${archive}" | sha256sum -c -'), 2)
