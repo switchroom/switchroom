@@ -28,6 +28,7 @@ COMPONENTS = {
                  'test_chromium_sandbox_*.py'),
     'perplexity': ('test_perplexity_provider.py',),
     'tooling': ('test_tooling_policy_hook.py',),
+    'image_extras': ('test_bot_screen_stale_lock.py',),
 }
 PREFIXES = {
     'plugins/linear/': 'linear',
@@ -42,6 +43,8 @@ PREFIXES = {
 }
 EXACT = {'scripts/claude-acp-subscription': 'claude',
          'scripts/tooling-policy-hook': 'tooling',
+         'scripts/hermes-tooling': 'tooling',
+         'scripts/bot-screen-stale-lock.py': 'image_extras',
          'scripts/sidecar_image_ref.py': 'sidecars'}
 SELECTOR_INPUTS = {'scripts/source-ci.py', 'tests/test_source_ci_scope.py'}
 # Unmapped paths the real-Agent legs read: the pinned Core, its environments, the runners and

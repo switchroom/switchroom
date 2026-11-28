@@ -47,6 +47,8 @@ IMAGE_INPUT_FILES: frozenset[str] = frozenset(
         "release/vex-exceptions.json",
         "scripts/claude-acp-subscription",
         "scripts/tooling-policy-hook",
+        "scripts/hermes-tooling",
+        "scripts/bot-screen-stale-lock.py",
         "scripts/compact-spdx-sbom.py",
         "scripts/emit-fleet-image-manifest.py",
         "scripts/extract-pushed-image-digest.py",

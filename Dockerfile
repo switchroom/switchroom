@@ -95,6 +95,14 @@ RUN /opt/hermes/.venv/bin/python /tmp/patch-honcho-sdk-floor.py /opt/hermes/plug
 COPY --chmod=0755 scripts/verify-honcho-plugin-core-seams.py /opt/hermes-fleet/bin/verify-honcho-plugin-core-seams.py
 RUN /opt/hermes/.venv/bin/python /opt/hermes-fleet/bin/verify-honcho-plugin-core-seams.py /opt/hermes/plugins/memory/honcho /opt/hermes
 
+# PM-managed tools (HF-856). PM's build API writes the pinned closure (versions come from PM's lock in
+# the Agent parent) straight into the immutable store; a runtime ensure() would redirect missing tools
+# into the /opt/data volume. cua-driver backs the computer_use toolset. pnpm is a required package in
+# PM's lock: without it every agent reports "install out of sync (pnpm)". PM publishes facts.json as
+# 0600; it is a non-secret inventory the runtime UID must read (never write) for native discovery.
+RUN cd /opt/hermes && /opt/hermes/.venv/bin/python -c 'from pathlib import Path; from pm.build_operations import prepare_tools; from pm.store import current_target; prepare_tools(["chromium", "cua-driver", "pnpm"], out=Path("/opt/hermes/tools"), target=current_target())' \
+    && chmod 0444 /opt/hermes/tools/facts.json
+
 # Bot Desktop and browsers (HF-773). The upstream Bot Screen desktop packages (moved here from the
 # private overlay, HF-550) plus Chromium, so every agent has a screen; nothing starts at
 # boot. No xfce4 metapackage (screensaver/power/polkit). adwaita-icon-theme-legacy: Adwaita 48 ships
@@ -259,6 +267,25 @@ RUN npm ci --omit=dev --prefix /opt/coding-clis --ignore-scripts --no-audit --no
 ENV CLAUDE_CODE_EXECUTABLE=/opt/coding-clis/node_modules/.bin/claude
 COPY --chmod=0755 scripts/claude-acp-subscription /usr/local/bin/hermes-claude-acp-subscription
 COPY --chmod=0755 scripts/tooling-policy-hook /opt/hermes/bin/tooling-policy-hook
+# Per-profile tool lock reconcile (plan/apply/verify/audit), used by the persistent-agent-tools skill.
+COPY --chmod=0755 scripts/hermes-tooling /opt/hermes/bin/hermes-tooling
+# The headless 1Password CLI autolaunches a D-Bus session daemon that never exits. It leaks PIDs and
+# keeps background-process supervisors waiting on a descendant forever, so jobs that call `op` never
+# complete. An explicit unavailable bus stops the autolaunch; `op read` still works without it.
+ENV DBUS_SESSION_BUS_ADDRESS=disabled:
+# /etc/profile replaces PATH, so login shells (bash -lc, sub-agents, agent terminals) would lose
+# hermes and hermes-tooling. The script also names /opt/data/bin, a profile-mounted directory that is
+# absent at bake time.
+COPY docker/profile.d/hermes-cli-path.sh /etc/profile.d/hermes-cli-path.sh
+RUN test -s /etc/profile.d/hermes-cli-path.sh \
+    && grep -q '/opt/data/bin' /etc/profile.d/hermes-cli-path.sh \
+    && bash -lc 'command -v hermes && command -v hermes-tooling'
+# Clears a Bot Screen browser lock left on the volume by an unclean stop. cont-init.d runs before s6
+# starts any service; the Bot Screen itself only starts on demand, after this.
+COPY --chmod=0755 scripts/bot-screen-stale-lock.py /etc/cont-init.d/017-bot-screen-stale-lock
+# Agents work in /opt/data/workspace on the profile volume; keep the conventional /workspace path.
+RUN rm -rf /workspace && ln -s /opt/data/workspace /workspace \
+    && /opt/hermes/bin/hermes-tooling audit
 COPY scripts/image_ref.py /opt/hermes-fleet/bin/image_ref.py
 COPY --chmod=0755 scripts/verify-agent-image-ref.py /opt/hermes-fleet/bin/verify-agent-image-ref
 COPY contracts/ /opt/hermes-fleet/contracts/
