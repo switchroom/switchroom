@@ -1,8 +1,11 @@
 schema_version: 1
 # Allowlisted desired-state keys for fleet-config/*.yaml, with their types.
 # This is not /etc/hermes/config.yaml (the managed policy layer).
-# Types: str, bool, int, list[str], list[provider] ({provider, model} entries)
-# and dict (a nested mapping with no null values).
+# Types: str, bool, int, bool|str (either), list[str], list[provider]
+# ({provider, model} entries) and dict (a nested mapping with no null values).
+# dict[T] is a mapping whose every value, at any depth, is a T (str, bool, int
+# or bool|str); dict[T|null] also accepts an explicit null, meaning "no value
+# for this" (for example dict[str|null] for a state name that may be unset).
 managed_leaves:
   # Overlay declarations for the setup check. Hermes ignores top-level keys
   # that start with an underscore.

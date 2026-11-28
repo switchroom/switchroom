@@ -26,11 +26,14 @@ ROOT = Path(__file__).resolve().parents[1]
 CONTRACT = ROOT / "contracts" / "plugins.json"
 MAX_INPUT_BYTES = 1024 * 1024
 
-SCHEMA_TYPES = {"str", "bool", "int", "list[str]", "list[provider]", "dict"}
-DEFAULTS_DOC_KEYS = {"values", "granted_providers", "defaults"}
+SCHEMA_TYPES = {"str", "bool", "int", "bool|str", "list[str]", "list[provider]", "dict"}
+# ``dict[T]`` or ``dict[T|null]``: a mapping, nested to any depth, whose every leaf value is a T.
+# ``|null`` also lets a leaf value be an explicit null ("no value for this").
+TYPED_DICT = re.compile(r"dict\[(str|bool|int|bool\|str)(\|null)?\]")
+DEFAULTS_DOC_KEYS = {"values", "granted_providers", "defaults", "remove_leaves"}
 DEFAULT_ENTRY_KEYS = {"values", "off_values", "requires_env", "plugins", "model", "primary_plan", "roles", "plans"}
 AGENT_REQUIRED_KEYS = {"profile", "role", "apply_mode", "values"}
-AGENT_OPTIONAL_KEYS = {"defaults", "granted_providers", "primary_plan", "roles"}
+AGENT_OPTIONAL_KEYS = {"defaults", "granted_providers", "primary_plan", "roles", "preserve_runtime_leaves"}
 ENV_NAME = re.compile(r"[A-Z][A-Z0-9_]{0,127}")
 ENV_REF = re.compile(r"\$\{(?:env:)?([^}]*)\}")
 PROFILE_NAME = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
@@ -232,6 +235,9 @@ class Rendered:
     # One per subscription plan and per task role (model-roles.plan.<plan>, model-roles.<role>).
     plan_decisions: dict[str, Decision] = field(default_factory=dict)
     role_decisions: dict[str, Decision] = field(default_factory=dict)
+    # Leaves left out of the managed file on purpose (this agent's preserve_runtime_leaves, fleet remove_leaves).
+    preserved: list[str] = field(default_factory=list)
+    removed: list[str] = field(default_factory=list)
 
     def report_lines(self) -> list[str]:
         lines: list[str] = []
@@ -240,6 +246,10 @@ class Rendered:
             if default_id == MODEL_ROLES:
                 lines.extend(d.line(plan_id(p)) for p, d in self.plan_decisions.items())
                 lines.extend(d.line(role_id(r)) for r, d in self.role_decisions.items())
+        if self.preserved:
+            lines.append(f"preserved (left to the agent's own config.yaml): {', '.join(self.preserved)}")
+        if self.removed:
+            lines.append(f"removed (intentionally absent fleet-wide): {', '.join(self.removed)}")
         return lines
 
 
@@ -416,10 +426,29 @@ def read_env_file(path: Path) -> dict[str, str]:
 
 # ------------------------------------------------------------- validation
 
+def valid_schema_type(kind: Any) -> bool:
+    return isinstance(kind, str) and (kind in SCHEMA_TYPES or TYPED_DICT.fullmatch(kind) is not None)
+
+
+def _typed_dict_ok(value: Any, scalar: str, nullable: bool) -> bool:
+    if value is None:
+        return nullable
+    if isinstance(value, dict):
+        return all(type(k) is str and _typed_dict_ok(v, scalar, nullable) for k, v in value.items())
+    return {"str": type(value) is str, "bool": type(value) is bool, "int": type(value) is int,
+            "bool|str": type(value) in (bool, str)}[scalar]
+
+
 def _check_type(path: str, value: Any, kind: str) -> None:
     if value is None:
         raise DefaultsError(f"{path}: null is ambiguous; omit the leaf instead")
+    typed = TYPED_DICT.fullmatch(kind)
+    if typed is not None:
+        if not isinstance(value, dict) or not _typed_dict_ok(value, typed.group(1), typed.group(2) is not None):
+            raise DefaultsError(f"type mismatch at {path}: expected {kind}")
+        return
     ok = {
+        "bool|str": lambda v: type(v) in (bool, str),
         "str": lambda v: type(v) is str,
         "bool": lambda v: type(v) is bool,
         "int": lambda v: type(v) is int,
@@ -465,6 +494,15 @@ def _env_refs(value: Any) -> set[str]:
     return set()
 
 
+def _leaf_list(value: Any, schema: Mapping[str, str], label: str) -> list[str]:
+    """A list of unique managed leaf paths from schema.yaml (exact leaves, not prefixes)."""
+    leaves = _str_list(value if value is not None else [], label)
+    unknown = [leaf for leaf in leaves if leaf not in schema]
+    if unknown:
+        raise DefaultsError(f"{label}: unknown leaf {unknown[0]!r} (add it to schema.yaml first)")
+    return leaves
+
+
 def _str_list(value: Any, label: str, pattern: re.Pattern[str] | None = None) -> list[str]:
     if not isinstance(value, list) or any(type(i) is not str or not i for i in value) or len(set(value)) != len(value):
         raise DefaultsError(f"{label}: must be a list of unique non-empty strings")
@@ -481,7 +519,7 @@ def load_schema(config_dir: Path) -> dict[str, str]:
     if not isinstance(leaves, dict) or not leaves:
         raise DefaultsError("schema.yaml: managed_leaves must be a non-empty mapping")
     for path, kind in leaves.items():
-        if type(path) is not str or kind not in SCHEMA_TYPES:
+        if type(path) is not str or not valid_schema_type(kind):
             raise DefaultsError(f"schema.yaml: {path!r} has unsupported type {kind!r}")
     names = sorted(leaves)
     for left, right in zip(names, names[1:]):
@@ -500,6 +538,7 @@ def load_defaults(config_dir: Path, schema: Mapping[str, str], contract: list[di
     if _env_refs(shared):
         raise DefaultsError("defaults.yaml values: shared leaves must not reference environment variables")
     granted = _str_list(doc.get("granted_providers", []), "defaults.yaml granted_providers")
+    removed = _leaf_list(doc.get("remove_leaves"), schema, "defaults.yaml remove_leaves")
     contract_ids = [entry["id"] for entry in contract]
     entries = doc.get("defaults", {}) or {}
     if not isinstance(entries, dict):
@@ -560,7 +599,13 @@ def load_defaults(config_dir: Path, schema: Mapping[str, str], contract: list[di
         raise DefaultsError(f"defaults.yaml values: {CONNECT_DEFAULT} owns the secret-source leaves")
     for reserved in sorted(ROLE_LEAVES | {"plugins.enabled", PRIMARY_PLAN_LEAF, ROLE_PLANS_LEAF}):
         if reserved in owned:
-            raise DefaultsError(f"defaults.yaml: {reserved} is built by the renderer; do not set it here")
+            raise DefaultsError(f"defaults.yaml: {reserved} is built by the renderer; do not set it here "
+                                "(set it in an agent's own values; routing leaves need model-roles off for that agent)")
+    # remove_leaves overrides the reviewed defaults and the routing, but a plain shared
+    # value for the same leaf is a contradiction, not an override.
+    for leaf in removed:
+        if leaf in shared:
+            raise DefaultsError(f"defaults.yaml remove_leaves: {leaf} is also set in values")
     order = {default_id: index for index, default_id in enumerate(contract_ids)}
     # The shared defaults must never opt every agent into manual deletion;
     # only one agent's own file may set it, and the setup check warns.
@@ -570,7 +615,7 @@ def load_defaults(config_dir: Path, schema: Mapping[str, str], contract: list[di
         if manual_delete_allowed(_unflatten(leaves)):
             raise DefaultsError(f"defaults.yaml {label}: {DISK_CLEANUP_MANUAL_DELETE} may only be set "
                                 "in one agent's own file")
-    return {"values": shared, "granted_providers": granted,
+    return {"values": shared, "granted_providers": granted, "remove_leaves": removed,
             "defaults": dict(sorted(parsed.items(), key=lambda item: order[item[0]]))}
 
 
@@ -640,12 +685,15 @@ def load_agent(config_dir: Path, agent: str, schema: Mapping[str, str], defaults
     keys = set(doc)
     if not AGENT_REQUIRED_KEYS <= keys or not keys <= AGENT_REQUIRED_KEYS | AGENT_OPTIONAL_KEYS:
         raise DefaultsError(f"{source}: needs profile, role, apply_mode and values "
-                            "(optional: defaults, granted_providers, primary_plan, roles)")
+                            "(optional: defaults, granted_providers, primary_plan, roles, preserve_runtime_leaves)")
     if doc["profile"] != agent:
         raise DefaultsError(f"{source}: profile must be {agent!r}")
     values = _validate_leaves(doc.get("values"), schema, f"{source} values")
-    if _env_refs(values):
-        raise DefaultsError(f"{source} values: must not reference environment variables")
+    # An agent's own values may carry ${NAME} secret references (for example an MCP server
+    # header). They stay unresolved in the rendered file; Hermes expands them at load.
+    for name in sorted(_env_refs(values)):
+        if not ENV_NAME.fullmatch(name):
+            raise DefaultsError(f"{source} values: ${{...}} reference names an invalid variable name")
     if CONNECT_PROVIDES_LEAF in values or SECRETS_SOURCE_LEAF in values:
         raise DefaultsError(f"{source} values: {CONNECT_DEFAULT} owns the secret-source leaves")
     opt = doc.get("defaults", {}) or {}
@@ -670,6 +718,15 @@ def load_agent(config_dir: Path, agent: str, schema: Mapping[str, str], defaults
         raise DefaultsError(f"{source} values: model roles are routed with primary_plan and roles, "
                             f"not by setting their Hermes leaves (or turn {MODEL_ROLES} off for this agent)")
     routing = (defaults["defaults"].get(MODEL_ROLES) or {}).get("routing")
+    preserved = _leaf_list(doc.get("preserve_runtime_leaves"), schema, f"{source} preserve_runtime_leaves")
+    for leaf in values:
+        if leaf in defaults["remove_leaves"]:
+            raise DefaultsError(f"{source} values: {leaf} is listed in remove_leaves in defaults.yaml")
+    for leaf in preserved:
+        if leaf in values:
+            raise DefaultsError(f"{source} preserve_runtime_leaves: {leaf} is also set in values")
+        if leaf in defaults["remove_leaves"]:
+            raise DefaultsError(f"{source} preserve_runtime_leaves: {leaf} is already in remove_leaves")
     primary = roles = None
     if ("primary_plan" in doc or "roles" in doc) and routing is None:
         raise DefaultsError(f"{source}: primary_plan and roles need {MODEL_ROLES} in defaults.yaml")
@@ -679,7 +736,7 @@ def load_agent(config_dir: Path, agent: str, schema: Mapping[str, str], defaults
     if "roles" in doc:
         roles = _role_plans(doc["roles"], f"{source} roles", known_plans, complete=False)
     return {"values": values, "defaults": dict(opt), "granted_providers": granted, "source": source,
-            "primary_plan": primary, "roles": roles or {}}
+            "primary_plan": primary, "roles": roles or {}, "preserved": preserved}
 
 
 # --------------------------------------------------------------- rendering
@@ -711,7 +768,8 @@ def _substitute_profile(value: Any, agent: str) -> Any:
 
 
 def render(config_dir: Path, agent: str, environ_names: Iterable[str], contract_path: Path = CONTRACT, *,
-           environ: Mapping[str, str] | None = None, paths: "ContainerPaths | None" = None) -> Rendered:
+           environ: Mapping[str, str] | None = None, paths: "ContainerPaths | None" = None,
+           verify_agent_refs: bool = True) -> Rendered:
     """Render one agent's managed config leaves for the given set-variable names.
 
     Each default goes through :func:`readiness`, the same check the setup check
@@ -719,6 +777,11 @@ def render(config_dir: Path, agent: str, environ_names: Iterable[str], contract_
     ``environ`` supplies the values of the path variables those checks read.
     Without ``paths`` a default whose credential is a file (a Claude login, the
     Linear token file) renders off, because a variable naming it is not a login.
+
+    ``${NAME}`` references in the agent's own values pass through unresolved. With
+    ``verify_agent_refs`` each NAME must be a set variable (only the name is checked
+    and reported, never a value); without it they are left unchecked, for a render
+    that was given no view of the runtime environment.
     """
     names = frozenset(environ_names)
     environ = dict(environ or {})
@@ -852,14 +915,23 @@ def render(config_dir: Path, agent: str, environ_names: Iterable[str], contract_
     leaves = {path: _substitute_profile(value, agent) for path, value in leaves.items()}
     for path, value in leaves.items():
         _check_type(path, value, schema[path])
-    unresolved = _env_refs(leaves) - names
+    agent_refs = _env_refs({path: leaves[path] for path in spec["values"]})
+    unresolved = _env_refs(leaves) - names - (set() if verify_agent_refs else agent_refs)
     if unresolved:
         raise DefaultsError(f"rendered config references unset variables: {sorted(unresolved)}")
+    # Leaves the managed file must not set: fleet-wide remove_leaves, and this
+    # agent's preserve_runtime_leaves (its own config.yaml value stays in force).
+    # Dropped last, so a routing or default value can never be the reason a leaf shows up.
+    preserved = list(spec["preserved"])
+    for path in [*defaults["remove_leaves"], *preserved]:
+        leaves.pop(path, None)
+        provenance.pop(path, None)
     config = _unflatten(leaves)
     for problem in (disk_cleanup_problem(config), hosted_speech_problem(config)):
         if problem:
             raise DefaultsError(problem)
-    return Rendered(agent, config, leaves, decisions, provenance, plan_decisions, role_decisions)
+    return Rendered(agent, config, leaves, decisions, provenance, plan_decisions, role_decisions,
+                    preserved=preserved, removed=list(defaults["remove_leaves"]))
 
 
 def route_text(chain: Iterable[Mapping[str, str]]) -> str:
