@@ -1,0 +1,9 @@
+name: screen-handoff
+kind: standalone
+version: 0.1.0
+description: "Native Bot Screen handoff over the profile's public Webapp URL: a screen_handoff tool (link/status/take_back) and automatic take-back when an authorized user messages the agent while still holding control."
+author: Hermes Fleet Contributors
+provides_tools:
+  - screen_handoff
+provides_hooks:
+  - post_gateway_admission

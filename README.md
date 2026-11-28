@@ -212,6 +212,7 @@ Coding agents should start at [`AGENTS.md`](AGENTS.md). Product scope is [`refer
 - [`plugins/linear/`](plugins/linear/) — optional Linear integration on core Kanban (staged, disabled)
 - [`plugins/kokoro-voice/`](plugins/kokoro-voice/) — optional local Kokoro sidecar TTS
 - [`recipes/`](recipes/) — opt-in Compose recipes: gated A2A, reviewed artifact publishing ([acceptance run](docs/opt-in-recipes-acceptance.md))
+- [`plugins/screen-handoff/`](plugins/screen-handoff/) — optional `screen_handoff` tool: a link to the agent's Bot Screen, plus automatic take-back when a user messages the agent
 - [`plugins/readonly-source/`](plugins/readonly-source/) — optional allowlisted read-only snapshot tools
 - [`scripts/tooling-policy-hook`](scripts/tooling-policy-hook) — optional overlay install-policy hook
 - [`SECURITY.md`](SECURITY.md) — vulnerability reporting and public boundary
