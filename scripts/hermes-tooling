@@ -1,0 +1,222 @@
+#!/usr/bin/env python3
+"""Reconcile profile-local tool locks without mutating the image."""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+HERMES_HOME = Path(os.environ.get("HERMES_HOME", "/opt/data"))
+
+
+def _load_yaml(path: Path) -> dict[str, Any]:
+    text = path.read_text(encoding="utf-8")
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        try:
+            import yaml  # type: ignore
+        except ImportError as exc:
+            raise RuntimeError(f"{path} is not JSON and PyYAML is unavailable") from exc
+        data = yaml.safe_load(text)
+    if not isinstance(data, dict):
+        raise ValueError(f"{path} is not a mapping")
+    return data
+
+
+def _expand(value: str) -> str:
+    return os.path.expandvars(value.replace("${HERMES_HOME}", str(HERMES_HOME)))
+
+
+def load_lock(path: Path) -> dict[str, Any]:
+    data = _load_yaml(path)
+    if data.get("apiVersion") != "switchroom.tools/v1alpha1":
+        raise ValueError(f"{path} missing switchroom.tools/v1alpha1")
+    return data
+
+
+def _venv_python(target: Path) -> Path:
+    return target / "bin" / "python"
+
+
+def _package_version(python: Path, package: str) -> str:
+    proc = subprocess.run(
+        [str(python), "-c", f"import importlib.metadata; print(importlib.metadata.version({package!r}))"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.strip() or f"cannot import {package}")
+    return proc.stdout.strip()
+
+
+def _node_npm_files(lock_path: Path, tool: dict[str, Any]) -> tuple[Path, Path]:
+    package_file = (lock_path.parent / str(tool["package_file"])).resolve()
+    lockfile = (lock_path.parent / str(tool["lockfile"])).resolve()
+    if not package_file.is_file():
+        raise FileNotFoundError(package_file)
+    if not lockfile.is_file():
+        raise FileNotFoundError(lockfile)
+    return package_file, lockfile
+
+
+def _node_npm_expected(lock_path: Path, tool: dict[str, Any]) -> dict[str, str]:
+    package_file, lockfile = _node_npm_files(lock_path, tool)
+    package = _load_yaml(package_file)
+    npm_lock = _load_yaml(lockfile)
+    expected = tool.get("verify", {}).get("packages")
+    if not isinstance(expected, dict) or not all(isinstance(name, str) and isinstance(version, str) for name, version in expected.items()):
+        raise ValueError(f"{tool.get('name')}: invalid Node package verification")
+    if package.get("dependencies") != expected:
+        raise ValueError(f"{tool.get('name')}: package file dependencies differ from verification")
+    if npm_lock.get("lockfileVersion") != 3 or npm_lock.get("packages", {}).get("", {}).get("dependencies") != expected:
+        raise ValueError(f"{tool.get('name')}: npm lock does not exactly pin dependencies")
+    return expected
+
+
+def _exposes(tool: dict[str, Any]) -> list[str]:
+    return [str(value) for value in tool.get("exposes") or []]
+
+
+def plan_tool(lock_path: Path, tool: dict[str, Any]) -> list[str]:
+    kind = tool.get("kind")
+    target = Path(_expand(str(tool["target"])))
+    if kind == "python-venv":
+        lockfile = lock_path.parent / str(tool["lockfile"])
+        actions = [f"ensure venv {target}", f"install --frozen from {lockfile}", f"verify {tool.get('package')}=={tool.get('version')}"]
+    elif kind == "node-npm":
+        package_file, lockfile = _node_npm_files(lock_path, tool)
+        expected = _node_npm_expected(lock_path, tool)
+        actions = [f"ensure npm project {target}", f"copy package file from {package_file}", f"npm ci --ignore-scripts from {lockfile}", "verify " + ", ".join(f"{name}=={version}" for name, version in expected.items())]
+    else:
+        raise ValueError(f"unsupported kind {kind!r}")
+    actions.extend(f"require executable {_expand(expose)}" for expose in _exposes(tool))
+    return actions
+
+
+def verify_tool(lock_path: Path, tool: dict[str, Any]) -> None:
+    target = Path(_expand(str(tool["target"])))
+    if tool.get("kind") == "node-npm":
+        for name, version in _node_npm_expected(lock_path, tool).items():
+            installed = target / "node_modules" / name / "package.json"
+            if not installed.is_file():
+                raise FileNotFoundError(installed)
+            if _load_yaml(installed).get("version") != version:
+                raise RuntimeError(f"{name} does not match {version}")
+    elif tool.get("kind") == "python-venv":
+        python = _venv_python(target)
+        if not python.exists():
+            raise FileNotFoundError(python)
+        package = str(tool["package"])
+        expected = str(tool["version"])
+        found = _package_version(python, package)
+        if found != expected:
+            raise RuntimeError(f"{package} is {found}, expected {expected}")
+    else:
+        raise ValueError(f"unsupported kind {tool.get('kind')!r}")
+    for expose in _exposes(tool):
+        path = Path(_expand(expose))
+        if not os.access(path, os.X_OK):
+            raise RuntimeError(f"not executable: {path}")
+        shebang = path.read_text(encoding="utf-8", errors="replace").splitlines()[:1]
+        if shebang and "venv-" in shebang[0] and str(target) not in shebang[0]:
+            raise RuntimeError(f"{path} shebang does not use {target}")
+
+
+def apply_tool(lock_path: Path, tool: dict[str, Any]) -> None:
+    target = Path(_expand(str(tool["target"])))
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if tool.get("kind") == "python-venv":
+        lockfile = (lock_path.parent / str(tool["lockfile"])).resolve()
+        if not lockfile.is_file():
+            raise FileNotFoundError(lockfile)
+        uv = shutil.which("uv")
+        if uv is None:
+            raise RuntimeError("uv is not on PATH")
+        if not target.exists():
+            subprocess.run([uv, "venv", str(target)], check=True)
+        subprocess.run([uv, "pip", "install", "--python", str(_venv_python(target)), "-r", str(lockfile)], check=True)
+    elif tool.get("kind") == "node-npm":
+        package_file, lockfile = _node_npm_files(lock_path, tool)
+        _node_npm_expected(lock_path, tool)
+        npm = shutil.which("npm")
+        if npm is None:
+            raise RuntimeError("npm is not on PATH")
+        target.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(package_file, target / "package.json")
+        shutil.copyfile(lockfile, target / "package-lock.json")
+        subprocess.run([npm, "ci", "--ignore-scripts"], cwd=target, check=True)
+    else:
+        raise ValueError(f"unsupported kind {tool.get('kind')!r}")
+    verify_tool(lock_path, tool)
+
+
+def cmd_plan(lock_path: Path) -> int:
+    for tool in load_lock(lock_path).get("tools") or []:
+        print(f"# {tool.get('name')}")
+        print(*plan_tool(lock_path, tool), sep="\n")
+    return 0
+
+
+def cmd_verify(lock_path: Path) -> int:
+    for tool in load_lock(lock_path).get("tools") or []:
+        verify_tool(lock_path, tool)
+        print(f"ok {tool.get('name')}")
+    return 0
+
+
+def cmd_apply(lock_path: Path) -> int:
+    for tool in load_lock(lock_path).get("tools") or []:
+        apply_tool(lock_path, tool)
+        print(f"applied {tool.get('name')}")
+    return 0
+
+
+def cmd_diagnose(lock_path: Path) -> int:
+    print(f"lock={lock_path}")
+    for tool in load_lock(lock_path).get("tools") or []:
+        target = Path(_expand(str(tool["target"])))
+        print(f"tool={tool.get('name')} kind={tool.get('kind')} target={target}")
+        if tool.get("kind") == "node-npm":
+            print(f"node={shutil.which('node') or 'missing'} npm={shutil.which('npm') or 'missing'}")
+            for name, version in _node_npm_expected(lock_path, tool).items():
+                installed = target / "node_modules" / name / "package.json"
+                found = _load_yaml(installed).get("version") if installed.is_file() else "missing"
+                print(f"package={name} expected={version} found={found}")
+        verify_tool(lock_path, tool)
+        print(f"ok {tool.get('name')}")
+    return 0
+
+
+def cmd_audit() -> int:
+    print(f"HERMES_HOME={HERMES_HOME}")
+    print(f"uv={shutil.which('uv') or 'missing'}")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    for name in ("plan", "apply", "verify", "diagnose"):
+        p = sub.add_parser(name)
+        p.add_argument("lock")
+    sub.add_parser("audit")
+    args = parser.parse_args(argv)
+    if args.cmd == "audit":
+        return cmd_audit()
+    lock_path = Path(args.lock).resolve()
+    return {"plan": cmd_plan, "apply": cmd_apply, "verify": cmd_verify, "diagnose": cmd_diagnose}[args.cmd](lock_path)
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except Exception as exc:  # noqa: BLE001
+        print(f"error: {exc}", file=sys.stderr)
+        raise SystemExit(1)
