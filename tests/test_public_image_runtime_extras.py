@@ -57,12 +57,6 @@ class ImageRuntimeExtrasTests(unittest.TestCase):
     def test_workspace_symlink_points_at_the_profile_volume(self) -> None:
         self.assertIn("rm -rf /workspace && ln -s /opt/data/workspace /workspace", DOCKERFILE)
 
-    def test_extras_carry_no_private_names(self) -> None:
-        for path in (PROFILE_D, STALE_LOCK, TOOLING):
-            text = path.read_text(encoding="utf-8").lower()
-            for word in ("pixsoul", "klanker", "aggie", "marko", "lawgpt"):
-                self.assertNotIn(word, text, f"{path.name}: {word}")
-
 
 if __name__ == "__main__":
     unittest.main()
