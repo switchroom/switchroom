@@ -100,8 +100,13 @@ RUN /opt/hermes/.venv/bin/python /opt/hermes-fleet/bin/verify-honcho-plugin-core
 # into the /opt/data volume. cua-driver backs the computer_use toolset. pnpm is a required package in
 # PM's lock: without it every agent reports "install out of sync (pnpm)". PM publishes facts.json as
 # 0600; it is a non-secret inventory the runtime UID must read (never write) for native discovery.
-RUN cd /opt/hermes && /opt/hermes/.venv/bin/python -c 'from pathlib import Path; from pm.build_operations import prepare_tools; from pm.store import current_target; prepare_tools(["chromium", "cua-driver", "pnpm"], out=Path("/opt/hermes/tools"), target=current_target())' \
-    && chmod 0444 /opt/hermes/tools/facts.json
+# PM keeps its download cache and install state under HERMES_HOME. Run it against a throwaway build
+# home: as root against /opt/data it leaves root-owned cache/installs that UID 1000 cannot write, so
+# every hermes command then fails on boot ("install state is not writable").
+RUN cd /opt/hermes && HERMES_HOME=/tmp/pm-build-home /opt/hermes/.venv/bin/python -c 'from pathlib import Path; from pm.build_operations import prepare_tools; from pm.store import current_target; prepare_tools(["chromium", "cua-driver", "pnpm"], out=Path("/opt/hermes/tools"), target=current_target())' \
+    && rm -rf /tmp/pm-build-home \
+    && chmod 0444 /opt/hermes/tools/facts.json \
+    && test -z "$(find /opt/data -user 0 -print -quit)"
 
 # Bot Desktop and browsers (HF-773). The upstream Bot Screen desktop packages (moved here from the
 # private overlay, HF-550) plus Chromium, so every agent has a screen; nothing starts at

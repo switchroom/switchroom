@@ -20,6 +20,13 @@ class ImageRuntimeExtrasTests(unittest.TestCase):
         self.assertIn('prepare_tools(["chromium", "cua-driver", "pnpm"]', DOCKERFILE)
         self.assertIn("chmod 0444 /opt/hermes/tools/facts.json", DOCKERFILE)
 
+    def test_pm_build_leaves_no_root_owned_state_on_the_profile_home(self) -> None:
+        # Root-owned PM cache/installs under /opt/data make every hermes command fail as UID 1000.
+        step = next(line for line in DOCKERFILE.splitlines() if "prepare_tools(" in line)
+        self.assertIn("HERMES_HOME=/tmp/pm-build-home ", step)
+        self.assertIn("rm -rf /tmp/pm-build-home", DOCKERFILE)
+        self.assertIn('test -z "$(find /opt/data -user 0 -print -quit)"', DOCKERFILE)
+
     def test_onepassword_autolaunch_is_disabled(self) -> None:
         self.assertRegex(DOCKERFILE, r"(?m)^ENV DBUS_SESSION_BUS_ADDRESS=disabled:$")
 
