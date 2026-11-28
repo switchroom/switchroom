@@ -3,7 +3,7 @@
   "version": "0.0.0",
   "private": true,
   "dependencies": {
-    "@agentclientprotocol/claude-agent-acp": "0.112.0",
+    "@agentclientprotocol/claude-agent-acp": "0.113.0",
     "@anthropic-ai/claude-code": "2.1.326",
     "@openai/codex": "0.172.0",
     "@xai-official/grok": "1.0.92",

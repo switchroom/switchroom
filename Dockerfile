@@ -234,7 +234,7 @@ RUN test ! -e /opt/hermes/plugins/web/perplexity
 # desktop/browser runtimes -> Honcho -> pinned CLIs -> provenance stamp (HF-851). Main promotes
 # the scanned PR image instead of rebuilding it, so the order mainly speeds up PR bakes.
 ARG CLAUDE_CODE_VERSION=2.1.326
-ARG CLAUDE_AGENT_ACP_VERSION=0.112.0
+ARG CLAUDE_AGENT_ACP_VERSION=0.113.0
 ARG CODEX_VERSION=0.172.0
 ARG GROK_VERSION=1.0.92
 COPY package.json package-lock.json /opt/coding-clis/
