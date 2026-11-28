@@ -366,6 +366,7 @@ jobs:
           assert acp_review.claude_code_session_options(set())["allowDangerouslySkipPermissions"] is False
           '
           docker run --rm --network none "$TEST_IMAGE" python3 -c 'import os; assert os.getuid() != 0'
+          docker run --rm --network none --entrypoint python3 "$TEST_IMAGE" /opt/hermes-fleet/bin/verify-runtime-dir.py
           docker run --rm --entrypoint hermes "$TEST_IMAGE" --version
 
       - name: Headed Camoufox smoke (UID 1000, fleet seccomp, no-new-privileges)
@@ -946,6 +947,7 @@ jobs:
           assert acp_review.claude_code_session_options(set())["allowDangerouslySkipPermissions"] is False
           '
           docker run --rm --network none "$TEST_IMAGE" python3 -c 'import os; assert os.getuid() != 0'
+          docker run --rm --network none --entrypoint python3 "$TEST_IMAGE" /opt/hermes-fleet/bin/verify-runtime-dir.py
           docker run --rm --entrypoint hermes "$TEST_IMAGE" --version
 
       - name: Headed Camoufox smoke (UID 1000, fleet seccomp, no-new-privileges)

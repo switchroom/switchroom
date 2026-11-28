@@ -293,6 +293,7 @@ RUN rm -rf /workspace && ln -s /opt/data/workspace /workspace \
     && /opt/hermes/bin/hermes-tooling audit
 COPY scripts/image_ref.py /opt/hermes-fleet/bin/image_ref.py
 COPY --chmod=0755 scripts/verify-agent-image-ref.py /opt/hermes-fleet/bin/verify-agent-image-ref
+COPY --chmod=0755 scripts/verify-runtime-dir.py /opt/hermes-fleet/bin/verify-runtime-dir.py
 COPY contracts/ /opt/hermes-fleet/contracts/
 ARG AGENT_IMAGE
 ARG ONEPASSWORD_CLI_IMAGE
@@ -317,8 +318,19 @@ LABEL org.opencontainers.image.source="https://github.com/switchroom/switchroom"
       hermes-fleet.source-tree="${FLEET_SOURCE_TREE}" \
       org.opencontainers.image.base.name="${AGENT_IMAGE}"
 RUN python3 -c 'import json, os, pathlib; marker = pathlib.Path("/etc/hermes-fleet/image-provenance.json"); marker.parent.mkdir(parents=True, exist_ok=True); marker.write_text(json.dumps({"schema": 1, "deployment_kind": "fleet_child_image", "image": os.environ["HERMES_FLEET_IMAGE_IDENTITY"], "revision": os.environ["HERMES_FLEET_GIT_SHA"], "tree": os.environ["HERMES_FLEET_SOURCE_TREE"], "parent_agent_image": os.environ["HERMES_FLEET_AGENT_IMAGE"], "onepassword_cli_image": os.environ["HERMES_FLEET_ONEPASSWORD_CLI_IMAGE"], "claude_code_version": os.environ["HERMES_FLEET_CLAUDE_CODE_VERSION"], "claude_agent_acp_version": os.environ["HERMES_FLEET_CLAUDE_AGENT_ACP_VERSION"], "codex_version": os.environ["HERMES_FLEET_CODEX_VERSION"], "grok_version": os.environ["HERMES_FLEET_GROK_VERSION"], "claude_acp_plugin_source": os.environ["HERMES_FLEET_CLAUDE_ACP_PLUGIN_SOURCE"], "claude_acp_plugin_revision": os.environ["HERMES_FLEET_CLAUDE_ACP_PLUGIN_REVISION"]}, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8"); marker.chmod(0o444)'
+# XDG_RUNTIME_DIR (inherited from the agent image) holds the Bot Desktop display-allocation lock and
+# dbus state. The agent image bakes it root:root 0700 and fixes ownership in its root start hook, but
+# this image starts as 1000, so that chown cannot run: bake it 1000:1000 0700 here, after every root
+# step. It sits in world-writable /tmp under a predictable name, so refuse a symlink before and after,
+# and drop any dbus state a build step left in it.
 RUN groupmod -g 1000 hermes \
     && usermod -u 1000 -g 1000 hermes \
     && mkdir -p /run \
-    && chown -R hermes:hermes /run
+    && chown -R hermes:hermes /run \
+    && test "${XDG_RUNTIME_DIR:-}" = /tmp/hermes-runtime \
+    && test ! -L /tmp/hermes-runtime \
+    && install -d -o 1000 -g 1000 -m 0700 /tmp/hermes-runtime \
+    && rm -rf /tmp/hermes-runtime/dbus-1 \
+    && test ! -L /tmp/hermes-runtime \
+    && test "$(stat -c '%u:%g:%a' /tmp/hermes-runtime)" = 1000:1000:700
 USER 1000:1000

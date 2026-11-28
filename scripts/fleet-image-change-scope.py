@@ -63,6 +63,7 @@ IMAGE_INPUT_FILES: frozenset[str] = frozenset(
         "scripts/verify-inherited-runtime-config.py",
         "scripts/verify-trivy-vex.py",
         "scripts/verify-camoufox-runtime.py",
+        "scripts/verify-runtime-dir.py",
         "security/chromium-seccomp.json",
     }
 )
