@@ -5,6 +5,10 @@ Shared defaults, then the reviewed starter defaults, then the agent's own
 values. Every leaf must be allowlisted and typed in schema.yaml. A default
 whose credential variable is not set is rendered off, never left half on.
 
+An agent's own values may carry ${NAME} secret references (for example an MCP server
+header). They pass through unresolved; with --process-env, --env-file or --check-files
+each NAME must be set (only the name is ever checked or printed, never a value).
+
 Only the names of set variables are used. Values are never read into the
 output; the config refers to them as ${NAME} for Hermes to expand at start.
 
@@ -56,7 +60,10 @@ def main(argv: list[str] | None = None) -> int:
         if args.check_files:
             hermes_home = args.hermes_home or str(environ.get("HERMES_HOME", "")).strip() or "/opt/data"
             paths = sd.ContainerPaths(root=args.root, hermes_home=hermes_home)
-        rendered = sd.render(args.fleet_config, args.agent, names, args.contract, environ=environ, paths=paths)
+        # ${NAME} references in the agent's own values are checked only when the render can see an environment.
+        sees_env = bool(args.process_env or args.env_file or args.check_files)
+        rendered = sd.render(args.fleet_config, args.agent, names, args.contract, environ=environ, paths=paths,
+                             verify_agent_refs=sees_env)
         text = sd.dump_config(rendered)
         if args.output:
             args.output.write_text(text, encoding="utf-8")

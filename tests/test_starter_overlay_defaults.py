@@ -284,7 +284,7 @@ class StarterOverlayRenderTests(unittest.TestCase):
             "unknown leaf": ("values:\n  browser.engine: auto\n", "unknown leaf"),
             "wrong type": ("values:\n  gateway.multiplex_profiles: 'false'\n", "type mismatch"),
             "null": ("values:\n  terminal.cwd: null\n", "null"),
-            "env in agent values": ("values:\n  terminal.cwd: ${PERPLEXITY_API_KEY}\n", "must not reference"),
+            "unset env reference in agent values": ("values:\n  terminal.cwd: ${NOT_A_SET_VARIABLE}\n", "unset variables"),
             "unknown default": ("defaults:\n  browser-handoff: false\nvalues: {}\n", "not configured"),
             "non-bool opt-out": ("defaults:\n  voice: 'no'\nvalues: {}\n", "true or false"),
         }

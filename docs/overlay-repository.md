@@ -65,6 +65,43 @@ default whose credential variable is unset is rendered off.
 reason. Steps are in `examples/overlay-repo/README.md`. Which subscription
 plan leads each task role is in [Choose your plans](choose-your-plans.md).
 
+### Schema types, secret references, preserved and removed leaves
+
+- **Types** in `schema.yaml`: `str`, `bool`, `int`, `bool|str` (a leaf that
+  takes either, such as a `true` or a mode name), `list[str]`,
+  `list[provider]`, `dict` (nested mapping, no nulls), and typed dicts
+  `dict[T]` where `T` is `str`, `bool`, `int` or `bool|str`: every value at any
+  depth must be a `T`. `dict[T|null]` also accepts an explicit `null`, for
+  example `dict[str|null]` for `team_states.ENG.blocked: null` ("no state for
+  this"). Null is refused everywhere else, and a leaf not in `schema.yaml` is
+  always refused.
+- **Secret references.** An agent's own `values` may carry `${NAME}` (for
+  example `Authorization: Bearer ${EXAMPLE_MCP_TOKEN}` in an MCP server
+  header). The renderer writes the reference as is; Hermes expands it when it
+  loads the file. With `--process-env`, `--env-file` or `--check-files` the
+  renderer checks that `NAME` is set and non-empty, and fails naming only the
+  variable; it never reads a value into output. With none of those it has no
+  view of the runtime and leaves references unchecked. Shared `defaults.yaml`
+  values still may not reference variables; a default references only its own
+  `requires_env`.
+- **`preserve_runtime_leaves`** in an agent file lists leaves the managed file
+  must not set, so the agent's own `config.yaml` value stays in force:
+  `preserve_runtime_leaves: [terminal.cwd]`. Each must be a leaf in
+  `schema.yaml` and not set in the same agent's `values`. `--report` lists them.
+- **`remove_leaves`** at the top level of `defaults.yaml` lists leaves that are
+  intentionally absent for the whole fleet: `remove_leaves: [agent.system_prompt]`.
+  They override a reviewed default's value and the model routing, but may not
+  also be set in shared or agent `values`.
+- **Routing leaves and `plugins.enabled`** are not shared values. The renderer
+  builds them from the reviewed defaults and `model-roles` (precedence: the
+  agent's own `values`, then the renderer's result, then Hermes' own default),
+  so one shared line cannot add a model or paid path to every agent. Set them
+  per agent: `plugins.enabled` in the agent's `values` replaces the default
+  list for that agent; a model leaf (`model.provider`, `delegation.model`, ...)
+  needs `defaults: {model-roles: false}` in that agent's file, and the setup
+  check then flags a provider outside `granted_providers`. To change model
+  routing for many agents use `primary_plan` and `roles` instead.
+
 Do not put credentials, OAuth state, memories, or sessions in the overlay git
 tree. Secret values fail closed: never git, never image, never managed YAML.
 Pin images by `@sha256:...`. Mutable tags are not a supported interface.
